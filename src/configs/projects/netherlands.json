@@ -1,0 +1,21 @@
+{
+  "project_id": "netherlands",
+  "customer_id": "harvey",
+  "apify_dataset_id": "CebgWL0NgapQr9rRO",
+  "gcs_bucket": "harvey-netherlands",
+  "firestore_collection": "netherlands",
+  "site_url": "https://uitspraken.rechtspraak.nl/",
+  "required_fields": [
+    "Wets-ID",
+    "Instantie",
+    "DatumUitspraak",
+    "DatumPublicatie",
+    "Zaaknummer",
+    "Rechtsgebieden",
+    "Wets-URL",
+    "Inhoudsindicatie",
+    "ECLI",
+    "WetInhoud",
+    "Bestandsnaam"
+  ]
+}

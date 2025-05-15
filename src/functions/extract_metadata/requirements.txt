@@ -1,0 +1,3 @@
+google-cloud-firestore==2.16.0
+google-cloud-pubsub==2.23.1
+apify-client==1.8.0
