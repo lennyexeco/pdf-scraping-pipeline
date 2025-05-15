@@ -78,6 +78,14 @@ target/
 # Jupyter Notebook
 .ipynb_checkpoints
 
+# Python stuff:
+*.pyc
+__pycache__/
+*.log
+.env
+credentials.json
+data/temp/
+
 # IPython
 profile_default/
 ipython_config.py
