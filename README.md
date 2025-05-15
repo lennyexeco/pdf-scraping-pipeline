@@ -13,3 +13,17 @@ A serverless web scraping pipeline for multiple customers and projects, using GC
 - `src/common/`: Shared utilities and configuration loader.
 - `tests/`: Unit tests for functions.
 - `scripts/`: Deployment and setup scripts.
+
+## Adding a New Customer
+1. Create `src/configs/customers/<customer_id>.json` with Apify key, Firestore DB, and GCP project ID.
+2. Create a GCS bucket: `gs://<customer_id>-<region>`.
+3. Update Cloud Scheduler with a new job for the customer.
+
+## Adding a New Project
+1. Create `src/configs/projects/<project_id>.json` with Apify dataset ID, GCS bucket, and required fields.
+2. Test the pipeline with a small dataset.
+
+## Monitoring
+- Check Firestore for metadata: `scraper-db/<customer_id>/<region>`.
+- Check GCS for files: `gs://<customer_id>-<region>`.
+- View logs in Cloud Logging.
