@@ -1,38 +1,53 @@
+import sys
+import os
+
+# Add the 'src' directory to the Python path
+sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..', '..')))
+
+import functions_framework
 from google.cloud import firestore, pubsub_v1
+import json
+import os  # This is a duplicate import, you can remove one
 from apify_client import ApifyClient
 from src.common.config import load_customer_config, load_project_config, get_secret
-from src.common.utils import generate_url_hash, logger
+from src.common.utils import generate_url_hash, setup_logging
 
-def extract_metadata(event, context):
-    data = json.loads(event['data'].decode('utf-8'))
-    customer_id = data['customer']
-    project_id = data['project']
-    dataset_id = data['dataset_id']
+@functions_framework.cloud_event
+def extract_metadata(cloud_event):
+    """Cloud Function triggered by Pub/Sub to extract metadata from Apify dataset."""
+    data = json.loads(cloud_event.data["message"]["data"].decode("utf-8"))
+    customer_id = data["customer"]
+    project_id = data["project"]
+    dataset_id = data["dataset_id"]
 
     customer_config = load_customer_config(customer_id)
     project_config = load_project_config(project_id)
-    apify_key = get_secret(customer_config['apify_api_key_secret'], customer_config['gcp_project_id'])
+    logger = setup_logging(customer_id, project_id)
 
+    apify_key = get_secret(customer_config["apify_api_key_secret"], customer_config["gcp_project_id"])
     client = ApifyClient(apify_key)
-    db = firestore.Client(project=customer_config['gcp_project_id'], database=customer_config['firestore_database'])
+    db = firestore.Client(project=customer_config["gcp_project_id"], database=customer_config["firestore_database"])
 
-    items = client.dataset(dataset_id).list_items(limit=50).items
+    batch_size = project_config.get("batch_size", 50)
+    items = client.dataset(dataset_id).list_items(limit=batch_size).items
     for item in items:
-        url = item.get('url', '')
+        url = item.get("url", "")
         url_hash = generate_url_hash(url)
-        doc_ref = db.collection(project_config['firestore_collection']).document(url_hash)
+        doc_ref = db.collection(project_config["firestore_collection"]).document(url_hash)
         doc_ref.set({
-            'url': url,
-            'title': item.get('title', 'Not Found'),
-            'description': item.get('Inhoudsindicatie', ''),
-            'scrape_date': firestore.SERVER_TIMESTAMP
+            "url": url,
+            "title": item.get("title", "Not Found"),
+            "description": item.get("Inhoudsindicatie", ""),
+            "scrape_date": firestore.SERVER_TIMESTAMP
         })
         logger.info(f"Saved metadata for {url}")
 
     publisher = pubsub_v1.PublisherClient()
-    topic_path = publisher.topic_path(customer_config['gcp_project_id'], 'store-html')
+    topic_path = publisher.topic_path(customer_config["gcp_project_id"], "store-html")
     publisher.publish(topic_path, json.dumps({
-        'customer': customer_id,
-        'project': project_id,
-        'dataset_id': dataset_id
-    }).encode('utf-8'))
+        "customer": customer_id,
+        "project": project_id,
+        "dataset_id": dataset_id
+    }).encode("utf-8"))
+
+    return {"status": "success"}

@@ -17,5 +17,27 @@
     "ECLI",
     "WetInhoud",
     "Bestandsnaam"
-  ]
+  ],
+  "image_url_fix": {
+    "base_url": "https://uitspraken.rechtspraak.nl",
+    "regex_pattern": "(<img\\s+[^>]*?src=\")(/image[^\"]*?)(\"[^>]*?>)"
+  },
+  "xml_structure": {
+    "root_tag": "NetherlandsLawFirm",
+    "declaration": true,
+    "indent": "  ",
+    "fields": [
+      {"tag": "WetsID", "source": "Wets-ID", "cdata": true},
+      {"tag": "Instantie", "source": "Instantie", "cdata": true},
+      {"tag": "DatumUitspraak", "source": "DatumUitspraak", "cdata": true},
+      {"tag": "DatumPublicatie", "source": "DatumPublicatie", "cdata": true},
+      {"tag": "Zaaknummer", "source": "Zaaknummer", "cdata": true},
+      {"tag": "Rechtsgebieden", "source": "Rechtsgebieden", "cdata": true},
+      {"tag": "WetsURL", "source": "Wets-URL", "cdata": true},
+      {"tag": "Inhoudsindicatie", "source": "Inhoudsindicatie", "cdata": true},
+      {"tag": "ECLI", "source": "ECLI", "cdata": true},
+      {"tag": "Content", "source": "WetInhoud", "cdata": true}
+    ],
+    "filename_field": "Bestandsnaam"
+  }
 }

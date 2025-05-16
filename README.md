@@ -14,6 +14,14 @@ A serverless web scraping pipeline for multiple customers and projects, using GC
 - `tests/`: Unit tests for functions.
 - `scripts/`: Deployment and setup scripts.
 
+## Processing Steps
+- **Extract Metadata**: Saves metadata to Firestore (`<customer>/<project>`).
+- **Store HTML**: Saves HTML to GCS (`pending/<project>/<date>`).
+- **Fix Image URLs**: Fixes image URLs, saves to GCS (`fixed/<project>/<date>`).
+- **Generate XML**: Creates XML files, saves to GCS (`delivered_xml/<project>/<date>`).
+- **Generate Reports**: Produces CSV reports, saves to GCS (`reports/<project>/<date>`).
+
+
 ## Adding a New Customer
 1. Create `src/configs/customers/<customer_id>.json` with Apify key, Firestore DB, and GCP project ID.
 2. Create a GCS bucket: `gs://<customer_id>-<region>`.
