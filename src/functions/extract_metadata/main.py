@@ -1,13 +1,6 @@
-import sys
-import os
-
-# Add the 'src' directory to the Python path
-sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..', '..')))
-
 import functions_framework
 from google.cloud import firestore, pubsub_v1
 import json
-import os  # This is a duplicate import, you can remove one
 from apify_client import ApifyClient
 from src.common.config import load_customer_config, load_project_config, get_secret
 from src.common.utils import generate_url_hash, setup_logging

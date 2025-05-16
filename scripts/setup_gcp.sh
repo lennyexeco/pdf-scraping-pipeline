@@ -2,7 +2,7 @@
 
 # Configuration variables
 PROJECT_ID="web-scraping-pipeline"
-REGION="europe-west4"
+REGION="europe-west1"
 SERVICE_ACCOUNT="scraper-service-account"
 FIRESTORE_DB="harvey-au"
 BUCKET_PREFIX="harvey-netherlands"

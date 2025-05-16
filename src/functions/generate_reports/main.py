@@ -2,14 +2,20 @@ import json
 import pandas as pd
 from google.cloud import storage, firestore
 from src.common.config import load_customer_config, load_project_config
-from src.common.utils import logger
+from src.common.utils import setup_logging
+from datetime import datetime
+import functions_framework
 
+@functions_framework.cloud_event
 def generate_reports(event, context):
     """Cloud Function to generate processing reports."""
     data = json.loads(event['data'].decode('utf-8'))
     customer_id = data['customer']
     project_id = data['project']
     date = data.get('date', datetime.now().strftime('%Y%m%d'))
+
+    # Initialize logger
+    logger = setup_logging(customer_id, project_id)
 
     customer_config = load_customer_config(customer_id)
     project_config = load_project_config(project_id)

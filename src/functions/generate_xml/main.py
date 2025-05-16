@@ -40,7 +40,7 @@ def generate_xml(event, context):
         url_hash = generate_url_hash(blob.name)
         doc_ref = db.collection(firestore_collection).document(url_hash)
         doc = doc_ref.get().to_dict()
-        if doc and doc.get('xml_path'):
+        if doc and doc.get('xml_path') and doc.get('process_status') == 'Processed':
             logger.info(f"Skipping {blob.name}: XML already generated")
             continue
 
@@ -79,7 +79,7 @@ def generate_xml(event, context):
                 pretty_xml = '<?xml version="1.0" encoding="UTF-8"?>\n' + pretty_xml
 
         # Save XML to GCS
-        filename = doc.get(filename_field, url_hash)
+        filename = doc.get(filename_field, doc.get('ECLI', url_hash))
         if not filename.lower().endswith('.xml'):
             filename += '.xml'
         xml_path = f"delivered_xml/{project_id}/{date}/{filename}"
@@ -90,7 +90,9 @@ def generate_xml(event, context):
         # Update Firestore
         doc_ref.update({
             'xml_path': f"gs://{bucket_name}/{xml_path}",
-            'xml_generated': datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+            'xml_generated': datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
+            'file_status': 'Present' if html_content else 'Not Found',
+            'process_status': 'Processed'
         })
 
         results.append({

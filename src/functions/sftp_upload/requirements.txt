@@ -1,0 +1,5 @@
+functions-framework==3.5.0
+google-cloud-storage==2.18.2
+google-cloud-pubsub==2.23.1
+paramiko==3.4.0
+google-cloud-secret-manager==2.20.2google-cloud-logging==3.10.0
