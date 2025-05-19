@@ -119,6 +119,7 @@ deploy_single_function() {
     --project="$PROJECT_ID" \
     --region="$REGION" \
     --service-account="$SERVICE_ACCOUNT" \
+    --timeout=540s \
     --no-gen2 \
     >> "$function_log_file" 2>&1; then
     echo "Error: Deployment of $function_name failed. Check $function_log_file for details." | tee -a "$LOG_FILE"
@@ -146,11 +147,12 @@ fi
 check_quota_project
 
 # Deploy Cloud Functions
-deploy_single_function "extract-metadata" "extract_metadata" "process-data" "functions/extract_metadata"
-deploy_single_function "store-html" "store_html" "store-html" "functions/store_html"
-deploy_single_function "fix-image-urls" "fix_image_urls" "fix-image-urls" "functions/fix_image_urls"
-deploy_single_function "generate-xml" "generate_xml" "generate-xml" "functions/generate_xml"
+# deploy_single_function "extract-metadata" "extract_metadata" "process-data" "functions/extract_metadata"
+# deploy_single_function "store-html" "store_html" "store-html" "functions/store_html"
+# deploy_single_function "fix-image-urls" "fix_image_urls" "fix-image-urls" "functions/fix_image_urls"
+# deploy_single_function "generate-xml" "generate_xml" "generate-xml" "functions/generate_xml"
 deploy_single_function "generate-reports" "generate_reports" "generate-reports" "functions/generate_reports"
-deploy_single_function "sftp-upload" "sftp_upload" "sftp-upload" "functions/sftp_upload"
+# deploy_single_function "sftp-upload" "sftp_upload" "sftp-upload" "functions/sftp_upload"
 
-echo "All Cloud Functions deployed successfully!" | tee -a "$LOG_FILE"
+# echo "All Cloud Functions deployed successfully!" | tee -a "$LOG_FILE"
+echo "extract-metadata Cloud Function deployment process completed." | tee -a "$LOG_FILE"

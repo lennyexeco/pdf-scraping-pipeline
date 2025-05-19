@@ -4,16 +4,23 @@
   "apify_dataset_id": "CebgWL0NgapQr9rRO",
   "gcs_bucket": "harvey-netherlands",
   "firestore_collection": "netherlands",
-  "firestore_database_id": "harvey-au",
+  "site_url": "https://uitspraken.rechtspraak.nl/",
   "required_fields": [
-    "Wets-ID", "Instantie", "DatumUitspraak", "DatumPublicatie", "Zaaknummer",
-    "Rechtsgebieden", "Wets-URL", "Inhoudsindicatie", "ECLI", "WetInhoud", "Bestandsnaam"
+    "Wets-ID",
+    "Instantie",
+    "DatumUitspraak",
+    "DatumPublicatie",
+    "Zaaknummer",
+    "Rechtsgebieden",
+    "Wets-URL",
+    "Inhoudsindicatie",
+    "ECLI",
+    "WetInhoud",
+    "Bestandsnaam"
   ],
   "image_url_fix": {
     "base_url": "https://uitspraken.rechtspraak.nl",
-    "regex_pattern": "(<img\\s+[^>]*?src=\")(/image[^\"]*?)(\"[^>]*?>)",
-    "gcs_pending_path": "pending/<project_id>/<date>",
-    "gcs_fixed_path": "fixed/<project_id>/<date>"
+    "regex_pattern": "(<img\\s+[^>]*?src=\")(/image[^\"]*?)(\"[^>]*?>)"
   },
   "xml_structure": {
     "root_tag": "NetherlandsLawFirm",
@@ -29,17 +36,8 @@
       {"tag": "WetsURL", "source": "Wets-URL", "cdata": true},
       {"tag": "Inhoudsindicatie", "source": "Inhoudsindicatie", "cdata": true},
       {"tag": "ECLI", "source": "ECLI", "cdata": true},
-      {"tag": "Content", "source": "fixed_html_content", "cdata": true}
+      {"tag": "Content", "source": "WetInhoud", "cdata": true}
     ],
-    "filename_field": "Bestandsnaam",
-    "gcs_xml_path": "delivered_xml/<project_id>/<date>"
-  },
-  "report_config": {
-    "gcs_report_path": "reports/<project_id>/<date>",
-    "fields": [
-      "ECLI", "Wets-ID", "Bestandsnaam", "Wets-URL", "Inhoudsindicatie",
-      "Instantie", "DatumUitspraak", "DatumPublicatie", "Zaaknummer", "Rechtsgebieden",
-      "html_path", "fixed_html_path", "xml_path", "xml_status", "images_fixed", "xml_generated_at"
-    ]
+    "filename_field": "Bestandsnaam"
   }
 }

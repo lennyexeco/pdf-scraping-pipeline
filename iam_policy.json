@@ -1,0 +1,321 @@
+{
+  "bindings": [
+    {
+      "members": [
+        "serviceAccount:service-435549401163@gcp-sa-artifactregistry.iam.gserviceaccount.com"
+      ],
+      "role": "roles/artifactregistry.serviceAgent"
+    },
+    {
+      "members": [
+        "serviceAccount:435549401163-compute@developer.gserviceaccount.com"
+      ],
+      "role": "roles/artifactregistry.writer"
+    },
+    {
+      "members": [
+        "serviceAccount:435549401163@cloudbuild.gserviceaccount.com"
+      ],
+      "role": "roles/cloudbuild.builds.builder"
+    },
+    {
+      "members": [
+        "serviceAccount:service-435549401163@gcp-sa-cloudbuild.iam.gserviceaccount.com"
+      ],
+      "role": "roles/cloudbuild.serviceAgent"
+    },
+    {
+      "members": [
+        "user:leonard.beadle@execo.com"
+      ],
+      "role": "roles/cloudfunctions.admin"
+    },
+    {
+      "members": [
+        "serviceAccount:service-435549401163@gcf-admin-robot.iam.gserviceaccount.com"
+      ],
+      "role": "roles/cloudfunctions.serviceAgent"
+    },
+    {
+      "members": [
+        "serviceAccount:service-435549401163@gcp-sa-cloudscheduler.iam.gserviceaccount.com"
+      ],
+      "role": "roles/cloudscheduler.serviceAgent"
+    },
+    {
+      "members": [
+        "user:castor.mark@execo.com",
+        "user:pucci.mburu@execo.com"
+      ],
+      "role": "roles/cloudsql.client"
+    },
+    {
+      "members": [
+        "serviceAccount:service-435549401163@gcp-sa-cloudtasks.iam.gserviceaccount.com"
+      ],
+      "role": "roles/cloudtasks.serviceAgent"
+    },
+    {
+      "members": [
+        "serviceAccount:service-435549401163@compute-system.iam.gserviceaccount.com"
+      ],
+      "role": "roles/compute.serviceAgent"
+    },
+    {
+      "members": [
+        "serviceAccount:service-435549401163@container-analysis.iam.gserviceaccount.com"
+      ],
+      "role": "roles/containeranalysis.ServiceAgent"
+    },
+    {
+      "members": [
+        "serviceAccount:service-435549401163@containerregistry.iam.gserviceaccount.com"
+      ],
+      "role": "roles/containerregistry.ServiceAgent"
+    },
+    {
+      "members": [
+        "serviceAccount:service-435549401163@dataflow-service-producer-prod.iam.gserviceaccount.com"
+      ],
+      "role": "roles/dataflow.serviceAgent"
+    },
+    {
+      "members": [
+        "serviceAccount:gcsbuckets@execo-harvey.iam.gserviceaccount.com"
+      ],
+      "role": "roles/datastore.user"
+    },
+    {
+      "members": [
+        "serviceAccount:service-435549401163@gcp-sa-discoveryengine.iam.gserviceaccount.com"
+      ],
+      "role": "roles/discoveryengine.serviceAgent"
+    },
+    {
+      "members": [
+        "serviceAccount:service-435549401163@gcp-sa-prod-dai-core.iam.gserviceaccount.com"
+      ],
+      "role": "roles/documentaicore.serviceAgent"
+    },
+    {
+      "members": [
+        "serviceAccount:435549401163-compute@developer.gserviceaccount.com",
+        "serviceAccount:435549401163@cloudservices.gserviceaccount.com",
+        "serviceAccount:execo-harvey@appspot.gserviceaccount.com",
+        "user:castor.mark@execo.com",
+        "user:leonard.beadle@execo.com",
+        "user:pucci.mburu@execo.com",
+        "user:stephen.bowen@execo.com"
+      ],
+      "role": "roles/editor"
+    },
+    {
+      "members": [
+        "serviceAccount:service-435549401163@gcp-sa-eventarc.iam.gserviceaccount.com"
+      ],
+      "role": "roles/eventarc.serviceAgent"
+    },
+    {
+      "members": [
+        "serviceAccount:gcsbuckets@execo-harvey.iam.gserviceaccount.com",
+        "user:bhavida.ramakrishnan@execo.com",
+        "user:castor.mark@execo.com",
+        "user:leonard.beadle@execo.com",
+        "user:pucci.mburu@execo.com",
+        "user:rashmita@execo.com",
+        "user:siddharth.saran@execo.com",
+        "user:soniya.agarwal@execo.com",
+        "user:swikruti.nimje@execo.com"
+      ],
+      "role": "roles/firebase.admin"
+    },
+    {
+      "members": [
+        "serviceAccount:service-435549401163@gcp-sa-firebase.iam.gserviceaccount.com"
+      ],
+      "role": "roles/firebase.managementServiceAgent"
+    },
+    {
+      "members": [
+        "serviceAccount:scraper-service-account@execo-harvey.iam.gserviceaccount.com"
+      ],
+      "role": "roles/firebase.sdkAdminServiceAgent"
+    },
+    {
+      "members": [
+        "serviceAccount:service-435549401163@firebase-rules.iam.gserviceaccount.com"
+      ],
+      "role": "roles/firebaserules.system"
+    },
+    {
+      "members": [
+        "serviceAccount:435549401163-compute@developer.gserviceaccount.com",
+        "user:leonard.beadle@execo.com",
+        "user:pucci.mburu@execo.com"
+      ],
+      "role": "roles/firebasestorage.admin"
+    },
+    {
+      "members": [
+        "serviceAccount:gcsbuckets@execo-harvey.iam.gserviceaccount.com"
+      ],
+      "role": "roles/firebasestorage.serviceAgent"
+    },
+    {
+      "members": [
+        "serviceAccount:435549401163-compute@developer.gserviceaccount.com",
+        "serviceAccount:gcsbuckets@execo-harvey.iam.gserviceaccount.com",
+        "serviceAccount:service-435549401163@gcp-sa-firestore.iam.gserviceaccount.com"
+      ],
+      "role": "roles/firestore.serviceAgent"
+    },
+    {
+      "members": [
+        "user:leonard.beadle@execo.com"
+      ],
+      "role": "roles/iam.serviceAccountCreator"
+    },
+    {
+      "members": [
+        "serviceAccount:scraper-service-account@execo-harvey.iam.gserviceaccount.com"
+      ],
+      "role": "roles/iam.serviceAccountTokenCreator"
+    },
+    {
+      "members": [
+        "serviceAccount:435549401163-compute@developer.gserviceaccount.com"
+      ],
+      "role": "roles/iam.serviceAccountUser"
+    },
+    {
+      "members": [
+        "serviceAccount:435549401163-compute@developer.gserviceaccount.com"
+      ],
+      "role": "roles/logging.logWriter"
+    },
+    {
+      "members": [
+        "serviceAccount:service-435549401163@gcp-sa-networkmanagement.iam.gserviceaccount.com"
+      ],
+      "role": "roles/networkmanagement.serviceAgent"
+    },
+    {
+      "members": [
+        "serviceAccount:ocr-access@execo-harvey.iam.gserviceaccount.com",
+        "user:hadi.alhazim@execo.com",
+        "user:ryan@execo.com",
+        "user:saurabh.agrawal@execo.com"
+      ],
+      "role": "roles/owner"
+    },
+    {
+      "members": [
+        "user:leonard.beadle@execo.com"
+      ],
+      "role": "roles/pubsub.admin"
+    },
+    {
+      "members": [
+        "serviceAccount:service-435549401163@gcp-sa-pubsub.iam.gserviceaccount.com"
+      ],
+      "role": "roles/pubsub.serviceAgent"
+    },
+    {
+      "members": [
+        "serviceAccount:435549401163-compute@developer.gserviceaccount.com"
+      ],
+      "role": "roles/run.admin"
+    },
+    {
+      "members": [
+        "serviceAccount:service-435549401163@serverless-robot-prod.iam.gserviceaccount.com"
+      ],
+      "role": "roles/run.serviceAgent"
+    },
+    {
+      "members": [
+        "user:leonard.beadle@execo.com"
+      ],
+      "role": "roles/secretmanager.admin"
+    },
+    {
+      "members": [
+        "serviceAccount:service-435549401163@service-networking.iam.gserviceaccount.com"
+      ],
+      "role": "roles/servicenetworking.serviceAgent"
+    },
+    {
+      "members": [
+        "serviceAccount:gcs-upload-service@execo-harvey.iam.gserviceaccount.com",
+        "serviceAccount:ocr-access@execo-harvey.iam.gserviceaccount.com",
+        "user:pucci.mburu@execo.com"
+      ],
+      "role": "roles/storage.admin"
+    },
+    {
+      "members": [
+        "serviceAccount:435549401163-compute@developer.gserviceaccount.com",
+        "serviceAccount:gcsbuckets@execo-harvey.iam.gserviceaccount.com",
+        "user:bhavida.ramakrishnan@execo.com",
+        "user:rashmita@execo.com",
+        "user:siddharth.saran@execo.com",
+        "user:soniya.agarwal@execo.com",
+        "user:swikruti.nimje@execo.com"
+      ],
+      "role": "roles/storage.bucketViewer"
+    },
+    {
+      "members": [
+        "user:bhavida.ramakrishnan@execo.com",
+        "user:siddharth.saran@execo.com",
+        "user:soniya.agarwal@execo.com"
+      ],
+      "role": "roles/storage.folderAdmin"
+    },
+    {
+      "members": [
+        "serviceAccount:435549401163-compute@developer.gserviceaccount.com",
+        "serviceAccount:eurlex-scraper-sa@execo-harvey.iam.gserviceaccount.com",
+        "user:leonard.beadle@execo.com",
+        "user:rashmita@execo.com",
+        "user:swikruti.nimje@execo.com"
+      ],
+      "role": "roles/storage.objectAdmin"
+    },
+    {
+      "members": [
+        "serviceAccount:ocr-access@execo-harvey.iam.gserviceaccount.com"
+      ],
+      "role": "roles/storage.objectCreator"
+    },
+    {
+      "members": [
+        "serviceAccount:gcsbuckets@execo-harvey.iam.gserviceaccount.com",
+        "serviceAccount:ocr-access@execo-harvey.iam.gserviceaccount.com",
+        "user:bhavida.ramakrishnan@execo.com",
+        "user:rashmita@execo.com",
+        "user:siddharth.saran@execo.com",
+        "user:soniya.agarwal@execo.com",
+        "user:swikruti.nimje@execo.com"
+      ],
+      "role": "roles/storage.objectViewer"
+    },
+    {
+      "members": [
+        "serviceAccount:service-435549401163@gcp-sa-storageinsights.iam.gserviceaccount.com"
+      ],
+      "role": "roles/storageinsights.serviceAgent"
+    },
+    {
+      "members": [
+        "user:bhavida.ramakrishnan@execo.com",
+        "user:rashmita@execo.com",
+        "user:siddharth.saran@execo.com",
+        "user:swikruti.nimje@execo.com"
+      ],
+      "role": "roles/viewer"
+    }
+  ],
+  "etag": "BwY1ONWKTFs=",
+  "version": 1
+}
