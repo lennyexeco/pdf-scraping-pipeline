@@ -2,11 +2,13 @@ import gzip
 import hashlib
 import logging
 from google.cloud import storage
+from google.cloud import logging as gcp_logging  # Added missing import
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 def compress_and_upload(content, bucket_name, destination_blob_name):
+    """Compress and upload content to GCS."""
     bucket = storage.Client().bucket(bucket_name)
     blob = bucket.blob(destination_blob_name)
     compressed = gzip.compress(content.encode())
@@ -15,6 +17,7 @@ def compress_and_upload(content, bucket_name, destination_blob_name):
     return destination_blob_name
 
 def generate_url_hash(url):
+    """Generate MD5 hash for a URL."""
     return hashlib.md5(url.encode()).hexdigest()
 
 def setup_logging(customer_id, project_id):

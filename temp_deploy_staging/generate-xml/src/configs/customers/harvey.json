@@ -1,6 +1,0 @@
-{
-  "customer_id": "harvey",
-  "firestore_database": "harvey-au",
-  "apify_api_key_secret": "apify-api-key",
-  "gcp_project_id": "execo-harvey"
-}

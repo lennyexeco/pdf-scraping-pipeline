@@ -1,0 +1,73 @@
+{
+  "project_id": "germany_federal_law",
+  "customer_id": "harvey",
+  "apify_search_results_dataset_id": "cd0PtExfw5D14Y1Lp",
+  "apify_contents_dataset_id": "fgWmr3HH87n3koggB",
+  "gcs_bucket": "harvey-germany",
+  "firestore_collection": "germany_federal_law",
+  "search_results_collection": "germany_search_results",
+  "firestore_database_id": "harvey-au",
+  "required_fields": [
+    "Law-ID",
+    "Title",
+    "Section",
+    "URL",
+    "Content"
+  ],
+  "search_required_fields": [
+    "abbreviation",
+    "main_url",
+    "full_name",
+    "pdf_link",
+    "raw_text"
+  ],
+  "gcs_search_results_path": "search_results/<project_id>/<date>",
+  "image_url_fix": {
+    "base_url": "https://www.gesetze-im-internet.de",
+    "regex_pattern": "(<img\\s+[^>]*?src=\")(/[^\"]*?)(\"[^>]*?>)",
+    "gcs_pending_path": "pending/<project_id>/<date>",
+    "gcs_fixed_path": "fixed/<project_id>/<date>",
+    "gcs_search_results_pending_path": "search_results/<project_id>/<date>",
+    "gcs_search_results_fixed_path": "search_results_fixed/<project_id>/<date>"
+  },
+  "xml_structure": {
+    "root_tag": "GermanyFederalLaw",
+    "declaration": true,
+    "indent": "  ",
+    "fields": [
+      {"tag": "LawID", "source": "Law-ID", "cdata": true},
+      {"tag": "Title", "source": "Title", "cdata": true},
+      {"tag": "Section", "source": "Section", "cdata": true},
+      {"tag": "URL", "source": "URL", "cdata": true},
+      {"tag": "Content", "source": "fixed_html_content", "cdata": true}
+    ],
+    "filename_field": "Title",
+    "gcs_xml_path": "delivered_xml/<project_id>/<date>"
+  },
+  "report_config": {
+    "gcs_report_path": "reports/<project_id>/<date>",
+    "fields": [
+      "Law-ID",
+      "Title",
+      "Section",
+      "URL",
+      "html_path",
+      "fixed_html_path",
+      "xml_path",
+      "xml_status",
+      "images_fixed",
+      "xml_generated_at"
+    ],
+    "search_results_fields": [
+      "abbreviation",
+      "main_url",
+      "full_name",
+      "pdf_link",
+      "raw_text",
+      "html_path",
+      "fixed_html_path"
+    ]
+  },
+  "apify_api_key_secret": "apify-api-key",
+  "batch_size": 10
+}
