@@ -2,6 +2,7 @@ import logging
 import re
 import json
 from bs4 import BeautifulSoup
+from datetime import datetime
 try:
     from vertexai.generative_models import GenerativeModel
     import vertexai
@@ -81,14 +82,20 @@ def resolve_computed_field(source, item, extra_context, logger_instance):
         for content_field in content_fields:
             content_field = content_field.strip()
             if item.get(content_field):
-                return extract_date_from_html(item[content_field], logger_instance)
+                date = extract_date_from_html(item[content_field], logger_instance)
+                if date != "Not Available":
+                    return date
+        logger_instance.warning(f"No valid date extracted from fields: {content_fields}")
         return "Not Available"
     elif "extract_title_from_html" in source:
         content_fields = source.replace("extract_title_from_html(", "").replace(")", "").split(" || ")
         for content_field in content_fields:
             content_field = content_field.strip()
             if item.get(content_field):
-                return extract_title_from_html(item[content_field], logger_instance)
+                title = extract_title_from_html(item[content_field], logger_instance)
+                if title != "untitled":
+                    return title
+        logger_instance.warning(f"No valid title extracted from fields: {content_fields}")
         return "untitled"
     elif "split('/').last.replace('.html', '')" in source:
         url_field = source.split(".split")[0].strip()
@@ -110,14 +117,20 @@ def get_mapped_field(item, field, field_mappings, logger_instance=None, extra_co
     field_type = mapping.get("type", "direct")
 
     if field_type == "computed":
-        return resolve_computed_field(source, item, extra_context or {}, current_logger)
+        value = resolve_computed_field(source, item, extra_context or {}, current_logger)
+        if value == "Not Available" or value == "untitled":
+            current_logger.debug(f"Computed field '{field}' returned default value: {value}")
+        return value
     else:
         source_fields = source.split(" || ")
         for source_field in source_fields:
             source_field = source_field.strip()
             if item.get(source_field) is not None:
-                return item[source_field]
-        current_logger.debug(f"No value found for field '{field}' in item.")
+                value = item[source_field]
+                if isinstance(value, str) and value.strip():
+                    current_logger.debug(f"Found value for field '{field}' in source '{source_field}': {value}")
+                    return value
+        current_logger.warning(f"No valid value found for field '{field}' in sources: {source_fields}. Item keys: {list(item.keys())}")
         return "Not Available"
 
 def generate_law_id(project_config_name, sequence_number, abbreviation=None):
@@ -192,16 +205,25 @@ def extract_title_from_html(html_content, logger_instance=None):
         selectors = [
             ('h1', {'class': 'jnlangue'}),
             ('h1', {}),
-            ('title', {})
+            ('title', {}),
+            ('div', {'class': 'jnnorm'}),
+            ('p', {'class': 'jntitel'})
         ]
         for tag, attrs in selectors:
             elem = soup.find(tag, **attrs)
             if elem:
                 title = elem.get_text(strip=True)
-                if title:
-                    current_logger.debug(f"Extracted title using {tag}: {title}")
+                if title and len(title) > 5:
+                    current_logger.debug(f"Extracted title using {tag} with attrs {attrs}: {title}")
                     return title
-        current_logger.debug("No title found in HTML.")
+        current_logger.warning("No valid title found in HTML. Checking meta tags.")
+        meta_title = soup.find('meta', {'name': 'title'})
+        if meta_title and meta_title.get('content'):
+            title = meta_title.get('content').strip()
+            if title:
+                current_logger.debug(f"Extracted title from meta tag: {title}")
+                return title
+        current_logger.debug("No title found in HTML or meta tags.")
         return "untitled"
     except Exception as e:
         current_logger.warning(f"Error extracting title from HTML: {str(e)}")
@@ -218,20 +240,32 @@ def extract_date_from_html(html_content, logger_instance=None):
         patterns = [
             (r'Ausfertigungsdatum\s*:\s*([\d\.]+)', 'p'),
             (r'Date\s*:\s*([\d\.]+)', 'p'),
-            (r'Issued\s*:\s*([\d\.]+)', 'p')
+            (r'Issued\s*:\s*([\d\.]+)', 'p'),
+            (r'Veröffentlicht\s*:\s*([\d\.]+)', 'p'),
+            (r'([\d]{2}\.[\d]{2}\.[\d]{4})', 'div')
         ]
         for pattern, tag in patterns:
             elem = soup.find(tag, string=re.compile(pattern, re.I))
             if elem:
                 date_text = re.search(pattern, elem.get_text(), re.I)
                 if date_text:
-                    current_logger.debug(f"Extracted date using pattern {pattern}: {date_text.group(1)}")
-                    return date_text.group(1)
-        current_logger.debug("No date found in HTML.")
+                    date = date_text.group(1)
+                    if re.match(r'\d{2}\.\d{2}\.\d{4}', date):
+                        current_logger.debug(f"Extracted date using pattern {pattern} in tag {tag}: {date}")
+                        return date
+        current_logger.warning("No valid date found in HTML.")
         return "Not Available"
     except Exception as e:
         current_logger.warning(f"Error extracting Ausfertigungsdatum from HTML: {str(e)}")
         return "Not Available"
+
+def sanitize_field_name(field_name):
+    """Sanitize Firestore field names by replacing invalid characters, preserving specific fields."""
+    if not field_name:
+        return field_name
+    if field_name in ["Law-ID", "Ausfertigungsdatum"]:  # Preserve specific field names
+        return field_name
+    return re.sub(r'[^\w\-]', '_', field_name)  # Allow hyphens
 
 def sanitize_error_message(error_message):
     """Sanitize an error message to remove sensitive information."""
@@ -342,3 +376,13 @@ def analyze_error_with_vertex_ai(error_message, stage, field_mappings, dataset_f
             "category": "llm_error",
             "adjusted_params": {}
         }
+
+def serialize_firestore_doc(data):
+    """Convert Firestore document data to JSON-serializable format."""
+    if isinstance(data, dict):
+        return {k: serialize_firestore_doc(v) for k, v in data.items()}
+    elif isinstance(data, list):
+        return [serialize_firestore_doc(item) for item in data]
+    elif isinstance(data, datetime):
+        return data.isoformat()
+    return data
