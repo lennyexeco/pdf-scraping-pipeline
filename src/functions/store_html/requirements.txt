@@ -6,3 +6,4 @@ google-cloud-secret-manager==2.20.2
 google-cloud-logging==3.10.0
 apify-client==1.8.0
 beautifulsoup4==4.12.3
+google-cloud-aiplatform==1.63.0

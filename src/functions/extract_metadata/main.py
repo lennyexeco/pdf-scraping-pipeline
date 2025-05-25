@@ -1,545 +1,475 @@
 import json
 import base64
 import logging
-import re
 import os
-from google.cloud import firestore, pubsub_v1, storage, aiplatform
-from google.cloud.aiplatform.gapic import PredictionServiceClient
-from apify_client import ApifyClient
-from src.common.utils import generate_url_hash, compress_and_upload, setup_logging
-from src.common.config import load_customer_config, load_project_config, get_secret
-from datetime import datetime
-from bs4 import BeautifulSoup
-# Removed: import functions_framework (not needed for Gen1 if not using its decorators explicitly)
 import time
+import re
+from google.cloud import firestore, pubsub_v1, storage
+from apify_client import ApifyClient
+from src.common.utils import generate_url_hash, setup_logging
+from src.common.config import load_customer_config, load_project_config, get_secret
+from src.common.helpers import find_url_in_item, get_mapped_field, generate_law_id, analyze_error_with_vertex_ai
+from vertexai.generative_models import GenerativeModel, Part
+import vertexai
+from datetime import datetime, timezone
+import functions_framework
 
-logger = logging.getLogger(__name__) # Module-level logger
+logger = logging.getLogger(__name__)
+
 MAX_ITEMS_PER_INVOCATION = int(os.environ.get("MAX_ITEMS_PER_INVOCATION", 250))
 APIFY_BATCH_SIZE = int(os.environ.get("APIFY_BATCH_SIZE", 50))
 SELF_TRIGGER_TOPIC_NAME = "process-data"
-NEXT_STEP_TOPIC_NAME = "store-html"
+NEXT_STEP_FIX_IMAGES_TOPIC_NAME = "fix-image-urls"
 RETRY_TOPIC_NAME = "retry-pipeline"
 MAX_API_RETRIES = 3
-RETRY_BACKOFF = 5  # seconds
+MAX_FIRESTORE_RETRIES = 3
+RETRY_BACKOFF = 5
+MAX_DOCUMENT_SIZE = 1_000_000
+LLM_MODEL_ID_FOR_HTML_DETECTION = "gemini-2.0-flash-lite-001"
 
-# --- Configuration for LLM Model ---
-# Ensure this is the exact model ID string from Model Garden for your region
-# For Gemini, it's often "gemini-1.0-pro", "gemini-1.5-flash", or a versioned one like "gemini-1.0-pro-002"
-# For PaLM, it would be "text-bison@002" or similar
-LLM_MODEL_ID = "gemini-2.0-flash-lite-001" # Updated as per request
-
-def extract_title_from_html(content):
-    """Extract title from HTML content."""
+TEST_PROCESS_LIMIT_ENV = os.environ.get("TEST_PROCESS_LIMIT")
+TEST_PROCESS_LIMIT = None
+if TEST_PROCESS_LIMIT_ENV:
     try:
-        soup = BeautifulSoup(content, 'html.parser')
-        h1 = soup.find('h1', class_='jnlangue') or soup.find('h1')
-        if h1:
-            return h1.get_text(strip=True)
-        title_tag = soup.find('title')
-        if title_tag:
-            return title_tag.get_text(strip=True)
-        return "untitled"
-    except Exception as e:
-        # Use the module-level logger if active_logger isn't defined in this scope
-        (logger_instance if 'logger_instance' in locals() and logger_instance else logger).warning(f"Error extracting title from content: {e}")
-        return "untitled"
+        TEST_PROCESS_LIMIT = int(TEST_PROCESS_LIMIT_ENV)
+        if TEST_PROCESS_LIMIT <= 0:
+            TEST_PROCESS_LIMIT = None
+            logger.info("TEST_PROCESS_LIMIT was not positive, disabling test limit.")
+        else:
+            logger.info(f"TEST_PROCESS_LIMIT is active: {TEST_PROCESS_LIMIT}")
+    except ValueError:
+        TEST_PROCESS_LIMIT = None
+        logger.warning(f"Invalid TEST_PROCESS_LIMIT value: '{TEST_PROCESS_LIMIT_ENV}'.")
 
-def generate_identifier(item, field_mappings):
-    """Generate a unique identifier for an item using mapped fields."""
-    id_mapping = field_mappings.get("Law-ID", {})
-    source_str = id_mapping.get("source", "htmlUrl || url || mainUrl")
-    url_fields = source_str.split(" || ")
-
-    for field in url_fields:
-        field = field.strip()
-        if item.get(field):
-            return generate_url_hash(item[field])
-    return generate_url_hash(f"no-id-{datetime.now().isoformat()}")
-
-def get_mapped_field(item, field, field_mappings, llm_client=None, llm_endpoint_str=None, gcp_project_id=None, logger_instance=None):
-    """Get the value for a field based on its mapping in field_mappings."""
-    mapping = field_mappings.get(field, {})
-    source = mapping.get("source", field)
-    field_type = mapping.get("type", "direct")
-    
-    # Ensure logger_instance is valid, otherwise use global logger
-    current_logger = logger_instance if logger_instance else logger
-
-    if field_type == "computed":
-        if "generate_url_hash" in source:
-            inner_source = source.replace("generate_url_hash(", "").replace(")", "")
-            url_fields = inner_source.split(" || ")
-            for url_field in url_fields:
-                url_field = url_field.strip()
-                if item.get(url_field):
-                    return generate_url_hash(item[url_field])
-            return generate_url_hash(f"no-id-{datetime.now().isoformat()}")
-        elif "split('/').last.replace('.html', '')" in source:
-            url_field_to_parse = source.split(".split")[0].strip()
-            if item.get(url_field_to_parse):
-                try:
-                    return item[url_field_to_parse].split("/")[-1].replace(".html", "")
-                except Exception:
-                    return ""
-            return ""
-        return "Not Available"
-    else: # Direct mapping
-        source_fields = source.split(" || ")
-        for source_field in source_fields:
-            source_field = source_field.strip()
-            if source_field.startswith("extract_title_from_html"):
-                inner_source = source_field.replace("extract_title_from_html(", "").replace(")", "")
-                content_fields = inner_source.split(" || ")
-                for content_field in content_fields:
-                    content_field = content_field.strip()
-                    if item.get(content_field):
-                        return extract_title_from_html(item[content_field]) # Pass current_logger if that func needs it
-                return "untitled"
-            if item.get(source_field) is not None:
-                return item[source_field]
-        
-        if llm_client and llm_endpoint_str and gcp_project_id and current_logger:
-            current_logger.info(f"No direct value for '{field}', attempting LLM suggestion.")
-            prompt = f"""
-            The dataset item has the following keys and a sample of their values:
-            { {k: str(v)[:100] + '...' if isinstance(v, str) and len(v) > 100 else v for k, v in item.items()} }
-
-            From the available data in the item, what would be the most appropriate value for the field named '{field}'?
-            If you can identify a direct field from the item that maps well to '{field}', use its value.
-            If not, and if '{field}' implies a common concept like 'Title' or 'Summary' that might be derivable from other text fields, try to derive it.
-            If a suitable value cannot be found or derived, output "Not Available".
-
-            Return a JSON object with a single key "suggested_value":
-            ```json
-            {{"suggested_value": "The value you determined for the field '{field}'"}}
-            ```
-            """
+def validate_html_content(content, logger_instance):
+    """Validate and normalize HTML content encoding."""
+    if not content:
+        return None
+    try:
+        if isinstance(content, bytes):
             try:
-                # --- PAYLOAD FOR GEMINI (if LLM_MODEL_ID is a Gemini model) ---
-                instances = [{"content": prompt}]
-                # --- PAYLOAD FOR PALM (e.g., text-bison) ---
-                # instances = [{"prompt": prompt}] # Uncomment if using PaLM
+                content = content.decode('utf-8')
+            except UnicodeDecodeError:
+                try:
+                    content = content.decode('latin-1')
+                    logger_instance.warning("HTML content decoded with latin-1 fallback.")
+                except UnicodeDecodeError:
+                    content = content.decode('utf-8', errors='replace')
+                    logger_instance.warning("HTML content decoded with error replacement.")
+        content.encode('utf-8')
+        return content
+    except Exception as e:
+        logger_instance.error(f"Failed to validate HTML content: {str(e)}")
+        return None
 
-                parameters = {"temperature": 0.7, "maxOutputTokens": 256, "topP": 0.8, "topK": 40}
-                
-                current_logger.debug(f"Sending to LLM for field '{field}'. Endpoint: {llm_endpoint_str}. Prompt: {prompt[:200]}...")
-                response = llm_client.predict(endpoint=llm_endpoint_str, instances=instances, parameters=parameters)
-                
-                if response.predictions:
-                    prediction_text = response.predictions[0].get('content')
-                    if not prediction_text: # Fallback for slightly different Gemini response structures
-                        parts = response.predictions[0].get('parts')
-                        if parts and isinstance(parts, list) and parts[0].get('text'):
-                            prediction_text = parts[0]['text']
+def get_html_content_from_item(item_data, project_config, gcp_project_id, active_logger):
+    html_content = None
+    html_field_found = None
+    html_fields_to_check = project_config.get('html_content_fields',
+                                             ['htmlContent', 'html', 'body', 'text', 'content'])
 
-                    if prediction_text:
-                        current_logger.debug(f"LLM raw response for '{field}': {prediction_text[:200]}")
-                        suggestion_json = None
-                        # Enhanced JSON extraction from markdown
-                        match = re.search(r"```json\s*([\s\S]*?)\s*```", prediction_text, re.MULTILINE | re.DOTALL)
-                        if match:
-                            try:
-                                suggestion_json = json.loads(match.group(1))
-                            except json.JSONDecodeError as e:
-                                current_logger.warning(f"LLM: Failed to parse JSON from markdown for '{field}': {e}. Raw: {match.group(1)}")
-                        else: # Try parsing directly if no markdown block
-                            try:
-                                suggestion_json = json.loads(prediction_text)
-                            except json.JSONDecodeError as e:
-                                current_logger.warning(f"LLM: Prediction for '{field}' not in markdown and not valid JSON: {e}. Raw: {prediction_text[:200]}")
-                        
-                        if suggestion_json and "suggested_value" in suggestion_json:
-                            suggested_value = suggestion_json["suggested_value"]
-                            if suggested_value != "Not Available":
-                                current_logger.info(f"LLM successfully suggested value for '{field}': '{str(suggested_value)[:100]}'")
-                                return suggested_value
-                            else:
-                                current_logger.info(f"LLM suggested 'Not Available' for '{field}'.")
-                        else:
-                            current_logger.warning(f"LLM suggestion for '{field}' missing 'suggested_value' key or invalid JSON. Response: {prediction_text[:200]}")
-                    else:
-                        current_logger.warning(f"LLM prediction empty for '{field}'. Full prediction: {response.predictions[0]}")
+    for field_name in html_fields_to_check:
+        value = item_data.get(field_name)
+        if isinstance(value, str) and value.strip():
+            if '<html' in value.lower() or ('<body' in value.lower() and ('<p' in value.lower() or '<div' in value.lower())):
+                html_content = validate_html_content(value, active_logger)
+                if html_content:
+                    html_field_found = field_name
+                    active_logger.info(f"Found HTML content in direct field '{html_field_found}'.")
+                    return html_content, html_field_found
+
+    if not html_content and project_config.get("enable_llm_html_field_detection", False):
+        active_logger.info("HTML content not found in standard fields. Attempting LLM inference for HTML field name.")
+        try:
+            vertexai.init(project=gcp_project_id, location=project_config.get("vertex_ai_location", "europe-west1"))
+            llm_model = GenerativeModel(LLM_MODEL_ID_FOR_HTML_DETECTION)
+            item_data_sample = {
+                k: (str(v)[:100] + '...' if isinstance(v, str) and len(v) > 100 else v)
+                for k, v in item_data.items() if k not in html_fields_to_check
+            }
+            if not item_data_sample:
+                item_data_sample = {"info": "Only previously checked fields were present or item is small."}
+
+            prompt = f"""
+            Given the Apify item data structure (keys and sample values):
+            {json.dumps(item_data_sample, indent=2)}
+            Identify the field name that MOST LIKELY contains the primary HTML content of the webpage.
+            Return a JSON object with a single key "html_field_candidate": Example: {{"html_field_candidate": "nameOfTheHtmlField"}}
+            If no field seems to contain HTML, return: {{"html_field_candidate": "Not Found"}}
+            """
+            response = llm_model.generate_content(
+                [Part.from_text(prompt)],
+                generation_config={"temperature": 0.2, "max_output_tokens": 100}
+            )
+            candidate_text = response.candidates[0].content.parts[0].text.strip()
+            json_match = re.search(r"\{.*\}", candidate_text, re.DOTALL)
+            if json_match:
+                suggestion_json = json.loads(json_match.group(0))
+                inferred_html_field = suggestion_json.get("html_field_candidate")
+                if inferred_html_field and inferred_html_field != "Not Found":
+                    value = item_data.get(inferred_html_field)
+                    if isinstance(value, str) and value.strip():
+                        html_content = validate_html_content(value, active_logger)
+                        if html_content and ('<html' in html_content.lower() or '<body' in html_content.lower()):
+                            html_field_found = inferred_html_field
+                            active_logger.info(f"LLM inferred HTML content field: '{html_field_found}'.")
+                            return html_content, html_field_found
+                    active_logger.warning(f"LLM suggested field '{inferred_html_field}' but it did not contain valid HTML or was empty.")
                 else:
-                    current_logger.warning(f"LLM returned no predictions for '{field}'.")
-            except Exception as e:
-                current_logger.warning(f"LLM field mapping API call failed for {field}: {str(e)}")
-        
-        return "Not Available"
+                    active_logger.warning("LLM could not identify a candidate HTML field or returned 'Not Found'.")
+            else:
+                active_logger.warning(f"LLM response for HTML field inference was not valid JSON: {candidate_text}")
+        except Exception as e_llm:
+            active_logger.error(f"LLM HTML content field inference failed: {str(e_llm)}", exc_info=True)
 
-# MODIFIED function signature for Gen1
-def extract_metadata(event, context):
-    active_logger = logger # Use module-level logger initially
+    if not html_field_found:
+        active_logger.warning("No HTML content field identified after checking standard fields and optional LLM inference.")
+    return html_content, html_field_found
+
+@functions_framework.cloud_event
+def extract_metadata(cloud_event):
+    active_logger = logger
+    pubsub_message = {}
+    publisher_client = None
+
     try:
-        # MODIFIED: For Gen1, data is in event['data']
-        pubsub_message_payload = event.get('data')
-        if not pubsub_message_payload:
-            active_logger.error(f"No 'data' field in event: {event}")
-            raise ValueError("Pub/Sub message data not found in event['data'].")
-        
-        pubsub_message = json.loads(base64.b64decode(pubsub_message_payload).decode('utf-8'))
-        
-        # MODIFIED: Use context.event_id and context.timestamp for Gen1
-        active_logger.info(f"Triggered by messageId: {context.event_id} at {context.timestamp}")
-        active_logger.info(f"Decoded Pub/Sub message: {pubsub_message}")
+        event_data = cloud_event.data
+        if 'message' in event_data and 'data' in event_data['message']:
+            pubsub_message_data = event_data['message']['data']
+            message_id = event_data['message'].get('messageId', 'N/A')
+            publish_time = event_data['message'].get('publishTime', 'N/A')
+        else:
+            pubsub_message_data = event_data.get('data')
+            message_id = cloud_event.id if hasattr(cloud_event, 'id') else 'N/A'
+            publish_time = cloud_event.time if hasattr(cloud_event, 'time') else 'N/A'
+
+        if not pubsub_message_data:
+            raise ValueError("No 'data' in Pub/Sub message.")
+
+        pubsub_message = json.loads(base64.b64decode(pubsub_message_data).decode('utf-8'))
+        active_logger.info(f"Triggered by messageId: {message_id} at {publish_time}")
 
         customer = pubsub_message.get("customer")
         project_config_name = pubsub_message.get("project")
-        dataset_id = pubsub_message.get("dataset_id")
-        dataset_type = pubsub_message.get("dataset_type", "items")
+        triggering_run_id = pubsub_message.get("dataset_id")
         current_offset = int(pubsub_message.get("offset", 0))
 
-        if not all([customer, project_config_name, dataset_id]):
-            active_logger.error(f"Missing required Pub/Sub fields: customer={customer}, project={project_config_name}, dataset_id={dataset_id}")
-            raise ValueError("Missing required Pub/Sub fields: customer, project, dataset_id")
+        if not all([customer, project_config_name, triggering_run_id]):
+            active_logger.error(f"Missing required Pub/Sub fields: customer, project, dataset_id.")
+            raise ValueError("Missing required Pub/Sub fields.")
 
         customer_config = load_customer_config(customer)
-        project_config = load_project_config(project_config_name)
-        
+        project_config = load_customer_config(project_config_name)
         gcp_project_id = customer_config.get("gcp_project_id", os.environ.get("GCP_PROJECT"))
         if not gcp_project_id:
-            active_logger.error("GCP Project ID not found in customer_config or GCP_PROJECT env var.")
+            active_logger.error("GCP Project ID not found.")
             raise ValueError("GCP Project ID not configured.")
 
-        active_logger = setup_logging(customer, project_config_name) # Re-initialize logger with customer/project context
-        active_logger.info(f"Processing dataset_id: {dataset_id}, type: {dataset_type}, offset: {current_offset}. GCP Project: {gcp_project_id}")
+        active_logger = setup_logging(customer, project_config_name)
+        active_logger.info(f"Extracting metadata for HTML content. Triggering Run ID: {triggering_run_id}, Offset: {current_offset}.")
 
-        required_fields = project_config.get("required_fields", [])
-        search_required_fields = project_config.get("search_required_fields", [])
+        apify_contents_dataset_id = pubsub_message.get("apify_contents_dataset_id_override") or \
+                                   project_config.get("apify_contents_dataset_id") or \
+                                   triggering_run_id
+
+        if not apify_contents_dataset_id:
+            active_logger.error("Apify Dataset ID for HTML content not found.")
+            raise ValueError("Apify HTML Content Dataset ID not configured.")
+        active_logger.info(f"Using Apify Dataset for HTML content: {apify_contents_dataset_id}")
+
         field_mappings = project_config.get("field_mappings", {})
+        required_fields = project_config.get("required_fields", [])
         firestore_collection_name = project_config.get("firestore_collection")
-        search_results_collection_name = project_config.get("search_results_collection", f"{firestore_collection_name}_search_results")
-        firestore_db_id = project_config.get("firestore_database_id")
+        firestore_db_id = project_config.get("firestore_database_id", "(default)")
         gcs_bucket_name = project_config.get("gcs_bucket")
+        gcs_temp_html_path_template = project_config.get("gcs_temp_html_path", f"temp_html/{project_config_name}/<date>")
+        error_collection_name = f"{firestore_collection_name}_errors"
+
+        missing_configs = []
+        if not firestore_collection_name: missing_configs.append("firestore_collection")
+        if not gcs_bucket_name: missing_configs.append("gcs_bucket")
+        if not gcs_temp_html_path_template: missing_configs.append("gcs_temp_html_path")
+        if missing_configs:
+            error_msg = f"Missing critical configuration: {', '.join(missing_configs)}"
+            active_logger.error(error_msg)
+            raise ValueError(error_msg)
 
         db_options = {"project": gcp_project_id}
-        if firestore_db_id:
+        if firestore_db_id != "(default)":
             db_options["database"] = firestore_db_id
         db = firestore.Client(**db_options)
         storage_client = storage.Client(project=gcp_project_id)
-        bucket = storage_client.bucket(gcs_bucket_name)
-        error_collection_name = f"{firestore_collection_name}_errors"
-
         apify_key = get_secret(project_config.get("apify_api_key_secret", "apify-api-key"), gcp_project_id)
         apify_client = ApifyClient(apify_key)
-        publisher = pubsub_v1.PublisherClient()
+        publisher_client = pubsub_v1.PublisherClient()
 
-        active_logger.info(f"Initializing Vertex AI for project {gcp_project_id}, location europe-west1.")
-        # aiplatform.init is generally not needed when using PredictionServiceClient directly with full endpoint path
-        # aiplatform.init(project=gcp_project_id, location='europe-west1') 
-        client_options = {"api_endpoint": "europe-west1-aiplatform.googleapis.com"}
-        llm_client = PredictionServiceClient(client_options=client_options)
-        
-        llm_endpoint_str = f"projects/{gcp_project_id}/locations/europe-west1/publishers/google/models/{LLM_MODEL_ID}"
-        active_logger.info(f"Using LLM endpoint: {llm_endpoint_str}")
-        
         total_items_processed = 0
-        dataset_exhausted = False
+        dataset_exhausted = not apify_contents_dataset_id
         results_summary = []
         error_batch = db.batch()
         error_operations_count = 0
+        firestore_batch = db.batch()
+        items_in_firestore_batch = 0
 
-        while total_items_processed < MAX_ITEMS_PER_INVOCATION:
-            active_logger.info(f"Fetching Apify data: Dataset: {dataset_id}, Offset: {current_offset}, Limit: {APIFY_BATCH_SIZE}")
-            items = None
+        sequence_doc_ref = db.collection(f"{firestore_collection_name}_metadata").document("sequence")
+        sequence_doc = sequence_doc_ref.get()
+        sequence_number = sequence_doc.to_dict().get("last_sequence", 0) + 1 if sequence_doc.exists else 1
+
+        content_items = []
+        if apify_contents_dataset_id:
+            dataset_exhausted = False
             for attempt in range(MAX_API_RETRIES):
                 try:
-                    response_apify = apify_client.dataset(dataset_id).list_items(offset=current_offset, limit=APIFY_BATCH_SIZE)
-                    items = response_apify.items # Corrected variable name
-                    active_logger.debug(f"Apify API call successful on attempt {attempt + 1}")
+                    content_response = apify_client.dataset(apify_contents_dataset_id).list_items(offset=current_offset, limit=APIFY_BATCH_SIZE)
+                    content_items = content_response.items
+                    active_logger.info(f"Fetched {len(content_items)} content items from Apify dataset {apify_contents_dataset_id} (offset {current_offset}).")
+                    if len(content_items) < APIFY_BATCH_SIZE:
+                        active_logger.info(f"Content dataset {apify_contents_dataset_id} exhausted.")
+                        dataset_exhausted = True
                     break
                 except Exception as e:
-                    active_logger.warning(f"Apify API call failed on attempt {attempt + 1}: {str(e)}")
+                    active_logger.warning(f"Apify API call for content dataset {apify_contents_dataset_id} failed (attempt {attempt + 1}): {e}")
                     if attempt < MAX_API_RETRIES - 1:
                         time.sleep(RETRY_BACKOFF * (2 ** attempt))
                     else:
-                        active_logger.error(f"Max retries reached for Apify API: {str(e)}")
-            
-            if not items:
-                active_logger.info("No items fetched from Apify (either dataset exhausted or fetch failed after retries).")
-                dataset_exhausted = True
+                        active_logger.error(f"Max retries for Apify content API (dataset {apify_contents_dataset_id}): {e}")
+                        dataset_exhausted = True
+                        content_items = []
+                        break
+
+        items_to_process = content_items
+        if TEST_PROCESS_LIMIT is not None and len(content_items) > TEST_PROCESS_LIMIT:
+            active_logger.info(f"TEST_PROCESS_LIMIT: Processing first {TEST_PROCESS_LIMIT} of {len(content_items)} content items.")
+            items_to_process = content_items[:TEST_PROCESS_LIMIT]
+
+        for item_index, item_data in enumerate(items_to_process):
+            if total_items_processed >= MAX_ITEMS_PER_INVOCATION:
+                active_logger.info(f"Reached MAX_ITEMS_PER_INVOCATION ({MAX_ITEMS_PER_INVOCATION}).")
+                dataset_exhausted = False
                 break
+            total_items_processed += 1
 
-            active_logger.info(f"Fetched {len(items)} items.")
-            firestore_batch = db.batch()
-            items_in_firestore_batch = 0
+            item_url, _ = find_url_in_item(item_data, active_logger)
+            if not item_url:
+                temp_identifier = generate_url_hash(f"temp-no-url-content-{item_data.get('id', 'unknown')}-{datetime.now().isoformat()}")
+                active_logger.warning(f"Skipping item at offset {current_offset + item_index} from {apify_contents_dataset_id} due to missing URL. Temp ID: {temp_identifier}")
+                results_summary.append({"identifier": temp_identifier, "url": "N/A", "status": "Error: No URL found for content item"})
+                error_doc_data = {
+                    "identifier": temp_identifier, "error": "Content Item missing URL", "stage": "extract_metadata_url_check",
+                    "original_item_excerpt": {k: str(v)[:200] for k, v in item_data.items()}, "timestamp": firestore.SERVER_TIMESTAMP,
+                    "customer": customer, "project": project_config_name,
+                    "apify_dataset_id_source": apify_contents_dataset_id, "original_offset": current_offset + item_index
+                }
+                error_batch.set(db.collection(error_collection_name).document(temp_identifier), error_doc_data)
+                error_operations_count += 1
+                continue
 
-            for item_index, item_data in enumerate(items):
-                identifier = generate_identifier(item_data, field_mappings)
-                try:
-                    metadata = {
-                        "raw_data": item_data, # Consider removing if too large and not always needed
-                        "mainUrl": get_mapped_field(item_data, "mainUrl", field_mappings, llm_client, llm_endpoint_str, gcp_project_id, active_logger),
-                        "scrape_date": item_data.get("extractionTimestamp", firestore.SERVER_TIMESTAMP),
-                        "processed_at_extract_metadata": firestore.SERVER_TIMESTAMP,
-                        "dataset_id_source": dataset_id,
-                        "offset_source": current_offset + item_index
-                    }
+            identifier = generate_url_hash(item_url)
+            html_content, html_content_source_field = get_html_content_from_item(item_data, project_config, gcp_project_id, active_logger)
 
-                    target_collection_name = search_results_collection_name if dataset_type == "search_results" else firestore_collection_name
-                    fields_to_process = search_required_fields if dataset_type == "search_results" else required_fields
+            if not html_content:
+                active_logger.warning(f"Skipping item {identifier} (URL: {item_url}) from {apify_contents_dataset_id} as no HTML content was found.")
+                results_summary.append({"identifier": identifier, "url": item_url, "status": "Skipped: No HTML content found"})
+                error_doc_data = {
+                    "identifier": identifier, "main_url": item_url, "error": "Item skipped: No HTML content found.",
+                    "stage": "extract_metadata_html_content_check", "timestamp": firestore.SERVER_TIMESTAMP,
+                    "customer": customer, "project": project_config_name,
+                    "apify_dataset_id_source": apify_contents_dataset_id, "original_offset": current_offset + item_index
+                }
+                error_batch.set(db.collection(error_collection_name).document(identifier + "_nohtml"), error_doc_data)
+                error_operations_count += 1
+                continue
 
-                    for field_name in fields_to_process:
-                        metadata[field_name] = get_mapped_field(item_data, field_name, field_mappings, llm_client, llm_endpoint_str, gcp_project_id, active_logger)
-
-                    llm_fields_to_enhance = [f_name for f_name in fields_to_process if metadata.get(f_name) in ["Not Available", "untitled", ""]]
-                    if llm_fields_to_enhance:
-                        active_logger.info(f"Attempting LLM enhancement for fields: {llm_fields_to_enhance} for identifier {identifier}")
-                        # Prioritize specific content fields, then fall back
-                        content_source_candidates = ["Content", "htmlContent", "text", "body"]
-                        content_for_llm = ""
-                        for source_key in content_source_candidates:
-                            if item_data.get(source_key):
-                                content_for_llm = item_data[source_key]
-                                break
-                        
-                        prompt_llm_enhance = f"""
-                        Analyze the following content and the current partially extracted metadata.
-                        Suggest values for the missing metadata fields: {llm_fields_to_enhance}.
-                        If a field implies a common concept (e.g., Title, Summary) try to derive it from the content.
-                        If a suitable value cannot be found or derived for a field, its value should be "Not Available".
-
-                        Content (first 1000 chars): {str(content_for_llm)[:1000]}
-                        Current Metadata (relevant fields): { {f_name: metadata.get(f_name) for f_name in fields_to_process} }
-                        Original item has keys: {list(item_data.keys())}
-
-                        Return ONLY a JSON object with the suggested values for the missing fields. Example for fields "Title", "Author":
-                        ```json
-                        {{
-                          "Title": "Suggested Title from Content",
-                          "Author": "Not Available"
-                        }}
-                        ```
-                        """
-                        try:
-                            instances_llm_enhance = [{"content": prompt_llm_enhance}] # For Gemini
-                            parameters_llm_enhance = {"temperature": 0.5, "maxOutputTokens": 512, "topP": 0.8, "topK": 40}
-                            
-                            active_logger.debug(f"Sending to LLM for enhancement. Endpoint: {llm_endpoint_str}. Prompt: {prompt_llm_enhance[:200]}...")
-                            response_llm_enhance = llm_client.predict(endpoint=llm_endpoint_str, instances=instances_llm_enhance, parameters=parameters_llm_enhance)
-                            
-                            if response_llm_enhance.predictions:
-                                prediction_text_enhance = response_llm_enhance.predictions[0].get('content')
-                                if not prediction_text_enhance: # Fallback
-                                    parts_enhance = response_llm_enhance.predictions[0].get('parts')
-                                    if parts_enhance and isinstance(parts_enhance, list) and parts_enhance[0].get('text'):
-                                        prediction_text_enhance = parts_enhance[0]['text']
-
-                                if prediction_text_enhance:
-                                    active_logger.debug(f"LLM enhancement raw response for {identifier}: {prediction_text_enhance[:200]}")
-                                    llm_suggestions_enhance = None
-                                    match_enhance = re.search(r"```json\s*([\s\S]*?)\s*```", prediction_text_enhance, re.MULTILINE | re.DOTALL)
-                                    if match_enhance:
-                                        try:
-                                            llm_suggestions_enhance = json.loads(match_enhance.group(1))
-                                        except json.JSONDecodeError as e_json:
-                                            active_logger.warning(f"LLM enhancement: Failed to parse JSON from markdown for {identifier}: {e_json}. Raw: {match_enhance.group(1)}")
-                                    else: # Try parsing directly
-                                        try:
-                                            llm_suggestions_enhance = json.loads(prediction_text_enhance)
-                                        except json.JSONDecodeError as e_json:
-                                            active_logger.warning(f"LLM enhancement: Prediction for {identifier} not in markdown and not valid JSON: {e_json}. Raw: {prediction_text_enhance[:200]}")
-
-                                    if llm_suggestions_enhance:
-                                        for field_to_enhance in llm_fields_to_enhance:
-                                            if field_to_enhance in llm_suggestions_enhance and llm_suggestions_enhance[field_to_enhance] not in ["Not Available", "untitled", ""]:
-                                                metadata[field_to_enhance] = llm_suggestions_enhance[field_to_enhance]
-                                                active_logger.info(f"LLM enhancement successful for field '{field_to_enhance}' for {identifier}. New value: '{str(metadata[field_to_enhance])[:100]}'")
-                                            else:
-                                                active_logger.info(f"LLM enhancement did not provide a new value for '{field_to_enhance}' for {identifier} (suggested: {llm_suggestions_enhance.get(field_to_enhance)}).")
-                                    else:
-                                         active_logger.warning(f"LLM enhancement could not parse suggestions for {identifier}. Response: {prediction_text_enhance[:200]}")
-                                else:
-                                    active_logger.warning(f"LLM enhancement prediction empty for {identifier}. Full prediction: {response_llm_enhance.predictions[0]}")
-                            else:
-                                active_logger.warning(f"LLM enhancement returned no predictions for {identifier}.")
-                        except Exception as e_llm:
-                            active_logger.warning(f"LLM enhancement API call failed for {identifier}: {str(e_llm)}")
-
-                    # Remove raw_data before size check if it's too large or not strictly needed in Firestore
-                    if "raw_data" in metadata and len(json.dumps(metadata["raw_data"])) > 500_000: # Heuristic
-                        active_logger.info(f"Potentially large 'raw_data' for {identifier}, removing before Firestore size check.")
-                        del metadata["raw_data"] # Or store it to GCS and link
-
-                    serialized_metadata_str = json.dumps(metadata, default=str)
-                    serialized_size = len(serialized_metadata_str.encode('utf-8'))
-
-                    if serialized_size > 1_000_000: # Firestore document limit is 1 MiB
-                        active_logger.warning(f"Document {identifier} (after potential LLM mapping) exceeds Firestore size limit ({serialized_size} bytes)")
-                        # Store original full item_data to GCS
-                        gcs_path_original_item = f"oversized_original_items/{project_config_name}/{dataset_id}/{identifier}.json.gz"
-                        compress_and_upload(json.dumps(item_data, default=str), gcs_bucket_name, gcs_path_original_item)
-                        
-                        # Create a minimal metadata record for Firestore
-                        final_metadata_for_oversized = {
-                            "identifier": identifier,
-                            "mainUrl": metadata.get("mainUrl", "Not Available"),
-                            "scrape_date": metadata.get("scrape_date"),
-                            "processed_at_extract_metadata": firestore.SERVER_TIMESTAMP,
-                            "dataset_id_source": dataset_id,
-                            "offset_source": current_offset + item_index,
-                            "full_item_gcs_path": f"gs://{gcs_bucket_name}/{gcs_path_original_item}",
-                            "status_notice": "Full item data stored in GCS due to size. Most fields are in GCS."
-                        }
-                        # Add a few key, small fields to the Firestore record if they exist and are small
-                        for key_field in ["Title", "Law-ID", "URL", "Document-Type"]: 
-                            if key_field in metadata and isinstance(metadata[key_field], str) and len(metadata[key_field]) < 200:
-                                final_metadata_for_oversized[key_field] = metadata[key_field]
-                        
-                        doc_ref = db.collection(target_collection_name).document(identifier)
-                        firestore_batch.set(doc_ref, final_metadata_for_oversized)
-                        items_in_firestore_batch +=1
-
-                        error_batch.set(db.collection(error_collection_name).document(identifier), {
-                            "identifier": identifier,
-                            "error": f"Document data for Firestore exceeds 1MB ({serialized_size} bytes), original item moved to GCS. Minimal metadata record created.",
-                            "stage": "extract_metadata_oversized",
-                            "retry_count": 0,
-                            "original_item_gcs_path": f"gs://{gcs_bucket_name}/{gcs_path_original_item}",
-                            "timestamp": firestore.SERVER_TIMESTAMP
-                        })
-                        error_operations_count += 1
-                        results_summary.append({"identifier": identifier, "status": "Success (Oversized item, full data in GCS, minimal metadata in Firestore)"})
-                        continue # Move to next item
-
-                    # If not oversized, store the (potentially LLM enhanced) metadata
-                    doc_ref = db.collection(target_collection_name).document(identifier)
-                    firestore_batch.set(doc_ref, metadata)
-                    items_in_firestore_batch += 1
-                    results_summary.append({"identifier": identifier, "url": metadata.get("URL", metadata.get("mainUrl", "N/A")), "status": "Queued for Firestore"})
-                
-                except Exception as e_item_proc:
-                    active_logger.error(f"Critical error processing item {identifier}: {str(e_item_proc)}", exc_info=True)
-                    error_batch.set(db.collection(error_collection_name).document(identifier), {
-                        "identifier": identifier,
-                        "error": str(e_item_proc),
-                        "stage": "extract_metadata_item_error",
-                        "retry_count": 0,
-                        "original_item": item_data, # Be cautious with large items here too
-                        "timestamp": firestore.SERVER_TIMESTAMP
-                    })
-                    error_operations_count += 1
-                    results_summary.append({"identifier": identifier, "status": f"Flagged for retry: {str(e_item_proc)}"})
-                    # Publish to retry topic
-                    publisher.publish(publisher.topic_path(gcp_project_id, RETRY_TOPIC_NAME), json.dumps({
-                        "customer": customer, "project": project_config_name, "dataset_id": dataset_id,
-                        "dataset_type": dataset_type, "identifier": identifier, "stage": "extract_metadata",
-                        "item_data_snapshot": {k: str(v)[:200] for k, v in item_data.items()}, # Snapshot for retry context
-                        "retry_count": 0 
-                    }).encode('utf-8'))
-                    continue # Move to next item
-
-            if items_in_firestore_batch > 0:
-                try:
-                    active_logger.info(f"Attempting to commit {items_in_firestore_batch} documents to Firestore.")
-                    items_attempted_ids_in_batch = [res["identifier"] for res in results_summary if res["status"] == "Queued for Firestore"][-items_in_firestore_batch:]
-                    firestore_batch.commit()
-                    active_logger.info(f"Committed {items_in_firestore_batch} documents to Firestore.")
-                    for res_id in items_attempted_ids_in_batch:
-                        for r_summary in results_summary:
-                            if r_summary["identifier"] == res_id and r_summary["status"] == "Queued for Firestore":
-                                r_summary["status"] = "Success (Firestore)"
-                                break
-                except Exception as e_commit:
-                    active_logger.error(f"Error committing Firestore batch: {str(e_commit)}", exc_info=True)
-                    for res_id in items_attempted_ids_in_batch:
-                        for r_summary in results_summary:
-                            if r_summary["identifier"] == res_id and r_summary["status"] == "Queued for Firestore":
-                                r_summary["status"] = f"Error (Firestore commit failed): {str(e_commit)}"
-                                active_logger.warning(f"Item {res_id} failed in batch commit. Sending to retry queue.")
-                                error_batch.set(db.collection(error_collection_name).document(res_id), {
-                                    "identifier": res_id,
-                                    "error": f"Firestore batch commit failed: {str(e_commit)}. Original item needs re-queuing.",
-                                    "stage": "extract_metadata_batch_commit_error",
-                                    "retry_count": 0,
-                                    "timestamp": firestore.SERVER_TIMESTAMP
-                                })
-                                error_operations_count += 1
-                                publisher.publish(publisher.topic_path(gcp_project_id, RETRY_TOPIC_NAME), json.dumps({
-                                    "customer": customer, "project": project_config_name, "dataset_id": dataset_id,
-                                    "dataset_type": dataset_type, "identifier": res_id, "stage": "extract_metadata",
-                                    "retry_count": 0
-                                }).encode('utf-8'))
-                                break # Found and processed this summary item
-
-            if error_operations_count > 0:
-                try:
-                    active_logger.info(f"Attempting to commit {error_operations_count} error documents.")
-                    error_batch.commit() # Commit the current error batch
-                    active_logger.info(f"Committed {error_operations_count} error documents.")
-                except Exception as e_err_commit:
-                    active_logger.error(f"CRITICAL: Failed to commit error batch to Firestore: {str(e_err_commit)}", exc_info=True)
-                error_operations_count = 0 # Reset for next potential batch of errors
-                error_batch = db.batch() # Start a new error batch
-
-            total_items_processed += len(items)
-            current_offset += len(items)
-
-            if len(items) < APIFY_BATCH_SIZE:
-                active_logger.info(f"Fetched {len(items)} items, which is less than APIFY_BATCH_SIZE ({APIFY_BATCH_SIZE}). Assuming end of dataset.")
-                dataset_exhausted = True
-                break
-        
-        # Final commit of any pending errors if loop exited for other reasons
-        if error_operations_count > 0:
-            try:
-                active_logger.info(f"Committing final {error_operations_count} pending error documents.")
-                error_batch.commit()
-                active_logger.info(f"Committed final {error_operations_count} error documents.")
-            except Exception as e_final_err_commit:
-                 active_logger.error(f"CRITICAL: Failed to commit final error batch: {str(e_final_err_commit)}", exc_info=True)
-
-        active_logger.info(f"Loop finished. Processed {total_items_processed} items in this invocation. Current offset for next potential run: {current_offset}. Dataset exhausted: {dataset_exhausted}")
-        
-        successful_commits_in_summary = sum(1 for r in results_summary if "Success (Firestore)" in r["status"] or "Success (Oversized item" in r["status"]) # Broadened "Oversized" check
-        active_logger.info(f"Summary for this invocation: {len(results_summary)} items attempted to map/process, {successful_commits_in_summary} successfully recorded in Firestore (or GCS for oversized).")
-
-        if not dataset_exhausted and total_items_processed >= MAX_ITEMS_PER_INVOCATION: # Check if it was MAX_ITEMS that stopped it
-            next_pubsub_message = {
-                "customer": customer, "project": project_config_name, "dataset_id": dataset_id,
-                "dataset_type": dataset_type, "offset": current_offset
+            metadata = {
+                "scrape_date": item_data.get("extractionTimestamp", datetime.now(timezone.utc)),
+                "apify_dataset_id_source": apify_contents_dataset_id,
+                "apify_run_id_trigger": triggering_run_id,
+                "source_offset": current_offset + item_index,
+                "main_url": item_url,
+                "processing_stage": "metadata_extracted_html_gcs_temp",
+                "last_updated": firestore.SERVER_TIMESTAMP
             }
-            topic_path_self = publisher.topic_path(gcp_project_id, SELF_TRIGGER_TOPIC_NAME)
-            active_logger.info(f"Max items per invocation ({MAX_ITEMS_PER_INVOCATION}) reached. Publishing re-trigger to '{SELF_TRIGGER_TOPIC_NAME}' with offset {current_offset}: {next_pubsub_message}")
-            future = publisher.publish(topic_path_self, json.dumps(next_pubsub_message).encode('utf-8'))
+
+            # Apply field mappings using get_mapped_field
+            for target_fs_field in required_fields:
+                value = get_mapped_field(
+                    item_data,
+                    target_fs_field,
+                    field_mappings,
+                    logger_instance=active_logger,
+                    extra_context={"sequence_number": sequence_number, "project": project_config_name}
+                )
+                if value is not None and value != "Not Available":
+                    metadata[target_fs_field] = value
+                    active_logger.debug(f"Mapped field '{target_fs_field}' to value: {value}")
+
+            # Store HTML content in GCS (uncompressed)
+            html_path_gcs = None
             try:
-                message_id = future.result(timeout=30)
-                active_logger.info(f"Published re-trigger message_id: {message_id}")
-            except TimeoutError: # google.cloud.pubsub_v1.futures.TimeoutError
-                active_logger.error("Publishing re-trigger timed out.")
-                raise # Re-raise to indicate function didn't complete all tasks
-        elif dataset_exhausted:
-            active_logger.info(f"Dataset {dataset_id} fully processed or no more items to fetch. Triggering '{NEXT_STEP_TOPIC_NAME}'.")
-            next_step_message = {
-                "customer": customer, "project": project_config_name, "dataset_id": dataset_id,
-                "dataset_type": dataset_type,
+                metadata_size_check = sum(len(str(k).encode('utf-8')) + len(str(v).encode('utf-8')) for k, v in metadata.items())
+                if len(html_content.encode('utf-8')) + metadata_size_check < MAX_DOCUMENT_SIZE * 2:  # Allow larger HTML since stored in GCS
+                    safe_project_id_path = "".join(c if c.isalnum() else '_' for c in project_config_name)
+                    date_str_path = pubsub_message.get("date", datetime.now().strftime('%Y%m%d'))
+                    final_gcs_temp_html_path = gcs_temp_html_path_template.replace("<date>", date_str_path)
+                    destination_blob_name = f"{final_gcs_temp_html_path.rstrip('/')}/{identifier}_temp.html"
+
+                    bucket = storage_client.bucket(gcs_bucket_name)
+                    blob = bucket.blob(destination_blob_name)
+                    for attempt in range(MAX_FIRESTORE_RETRIES):
+                        try:
+                            blob.upload_from_string(html_content, content_type="text/html; charset=utf-8")
+                            html_path_gcs = f"gs://{gcs_bucket_name}/{destination_blob_name}"
+                            metadata["html_path"] = html_path_gcs
+                            metadata["htmlContent_source_field"] = html_content_source_field
+                            active_logger.info(f"Stored uncompressed HTML for {identifier} to GCS: {html_path_gcs}")
+                            break
+                        except Exception as e_upload:
+                            active_logger.warning(f"GCS upload failed for {destination_blob_name} on attempt {attempt + 1}: {str(e_upload)}")
+                            if attempt < MAX_FIRESTORE_RETRIES - 1:
+                                time.sleep(RETRY_BACKOFF * (2 ** attempt))
+                            else:
+                                raise Exception(f"Max retries reached for GCS upload: {str(e_upload)}")
+                else:
+                    active_logger.warning(f"HTML content for {identifier} is too large. Size: {len(html_content.encode('utf-8'))}. Skipping item.")
+                    error_doc_data = {
+                        "identifier": identifier, "main_url": item_url, "error": "HTML content too large for GCS processing.",
+                        "stage": "extract_metadata_html_size_check", "timestamp": firestore.SERVER_TIMESTAMP,
+                        "customer": customer, "project": project_config_name,
+                        "apify_dataset_id_source": apify_contents_dataset_id, "original_offset": current_offset + item_index
+                    }
+                    error_batch.set(db.collection(error_collection_name).document(identifier + "_html_oversize"), error_doc_data)
+                    error_operations_count += 1
+                    results_summary.append({"identifier": identifier, "url": item_url, "status": "Skipped: HTML too large for GCS path"})
+                    continue
+            except Exception as e_gcs_upload:
+                active_logger.error(f"Failed to upload HTML for {identifier} to GCS: {e_gcs_upload}", exc_info=True)
+                error_doc_data = {
+                    "identifier": identifier, "main_url": item_url, "error": f"GCS HTML upload failed: {str(e_gcs_upload)}",
+                    "stage": "extract_metadata_gcs_temp_upload", "timestamp": firestore.SERVER_TIMESTAMP,
+                    "customer": customer, "project": project_config_name,
+                    "apify_dataset_id_source": apify_contents_dataset_id, "original_offset": current_offset + item_index
+                }
+                error_batch.set(db.collection(error_collection_name).document(identifier + "_gcs_temp_err"), error_doc_data)
+                error_operations_count += 1
+                results_summary.append({"identifier": identifier, "url": item_url, "status": "Error: GCS HTML upload failed"})
+                continue
+
+            sequence_number += 1
+            doc_ref = db.collection(firestore_collection_name).document(identifier)
+            firestore_batch.set(doc_ref, metadata, merge=True)
+            items_in_firestore_batch += 1
+            results_summary.append({"identifier": identifier, "url": item_url, "status": "Metadata with GCS HTML path queued; fix-image-urls triggered"})
+
+            pub_payload_fix_images = {
+                "customer": customer,
+                "project": project_config_name,
+                "identifier": identifier,
+                "main_url": item_url,
+                "html_path": html_path_gcs,
+                "date": pubsub_message.get("date", datetime.now().strftime('%Y%m%d')),
+                "apify_dataset_id_source": apify_contents_dataset_id,
+                "apify_run_id_trigger": triggering_run_id
+            }
+            publisher_client.publish(
+                publisher_client.topic_path(gcp_project_id, NEXT_STEP_FIX_IMAGES_TOPIC_NAME),
+                json.dumps(pub_payload_fix_images, default=str).encode('utf-8')
+            )
+
+        if items_in_firestore_batch > 0:
+            active_logger.info(f"Committing {items_in_firestore_batch} document operations to Firestore.")
+            for attempt in range(MAX_FIRESTORE_RETRIES):
+                try:
+                    firestore_batch.commit()
+                    active_logger.info(f"Successfully committed {items_in_firestore_batch} document operations.")
+                    break
+                except Exception as e_commit:
+                    active_logger.warning(f"Firestore batch commit failed on attempt {attempt + 1}: {str(e_commit)}")
+                    if attempt < MAX_FIRESTORE_RETRIES - 1:
+                        time.sleep(RETRY_BACKOFF * (2 ** attempt))
+                    else:
+                        active_logger.error(f"Max retries reached for Firestore batch commit: {str(e_commit)}")
+                        raise
+            if (sequence_doc.exists and (sequence_number > (sequence_doc.to_dict().get("last_sequence", 0) + 1))) or \
+               (not sequence_doc.exists and sequence_number > 1):
+                for attempt in range(MAX_FIRESTORE_RETRIES):
+                    try:
+                        sequence_doc_ref.set({"last_sequence": sequence_number - 1}, merge=True)
+                        break
+                    except Exception as e_update:
+                        active_logger.warning(f"Sequence update failed on attempt {attempt + 1}: {str(e_update)}")
+                        if attempt < MAX_FIRESTORE_RETRIES - 1:
+                            time.sleep(RETRY_BACKOFF * (2 ** attempt))
+                        else:
+                            active_logger.error(f"Max retries reached for sequence update: {str(e_update)}")
+                            raise
+        if error_operations_count > 0:
+            active_logger.info(f"Committing {error_operations_count} error documents.")
+            for attempt in range(MAX_FIRESTORE_RETRIES):
+                try:
+                    error_batch.commit()
+                    break
+                except Exception as e_commit:
+                    active_logger.warning(f"Error batch commit failed on attempt {attempt + 1}: {str(e_commit)}")
+                    if attempt < MAX_FIRESTORE_RETRIES - 1:
+                        time.sleep(RETRY_BACKOFF * (2 ** attempt))
+                    else:
+                        active_logger.error(f"Max retries reached for error batch commit: {str(e_commit)}")
+                        raise
+
+        should_retrigger = False
+        if TEST_PROCESS_LIMIT is not None:
+            active_logger.info(f"TEST_PROCESS_LIMIT ({TEST_PROCESS_LIMIT}) active. No re-triggering.")
+        elif not dataset_exhausted:
+            if total_items_processed >= MAX_ITEMS_PER_INVOCATION or \
+               (total_items_processed > 0 and len(content_items) == APIFY_BATCH_SIZE) or \
+               (total_items_processed == 0 and len(content_items) > 0 and not dataset_exhausted):
+                should_retrigger = True
+
+        if should_retrigger:
+            next_offset = current_offset + APIFY_BATCH_SIZE
+            retrigger_message = {
+                "customer": customer, "project": project_config_name,
+                "dataset_id": triggering_run_id,
+                "apify_contents_dataset_id_override": apify_contents_dataset_id,
+                "offset": next_offset,
                 "date": pubsub_message.get("date", datetime.now().strftime('%Y%m%d'))
             }
-            topic_path_next = publisher.topic_path(gcp_project_id, NEXT_STEP_TOPIC_NAME)
-            active_logger.info(f"Publishing to '{NEXT_STEP_TOPIC_NAME}': {next_step_message}")
-            future = publisher.publish(topic_path_next, json.dumps(next_step_message).encode('utf-8'))
-            try:
-                message_id = future.result(timeout=30)
-                active_logger.info(f"Published next-step message_id: {message_id}")
-            except TimeoutError: # google.cloud.pubsub_v1.futures.TimeoutError
-                active_logger.error(f"Publishing to '{NEXT_STEP_TOPIC_NAME}' timed out.")
-                raise
-        else: # Loop ended for other reasons, e.g. MAX_ITEMS_PER_INVOCATION not hit but dataset not marked exhausted
-            active_logger.warning(f"Loop ended. Total processed: {total_items_processed}. MAX_ITEMS_PER_INVOCATION: {MAX_ITEMS_PER_INVOCATION}. Dataset exhausted: {dataset_exhausted}. No re-trigger or next step initiated under current conditions.")
+            active_logger.info(f"Re-triggering for content dataset {apify_contents_dataset_id} to '{SELF_TRIGGER_TOPIC_NAME}' with offset {next_offset}")
+            publisher_client.publish(
+                publisher_client.topic_path(gcp_project_id, SELF_TRIGGER_TOPIC_NAME),
+                json.dumps(retrigger_message, default=str).encode('utf-8')
+            )
+        else:
+            active_logger.info(f"Content dataset {apify_contents_dataset_id} processing complete for this branch (offset {current_offset}) or test limit applied.")
 
-        # Log metadata about the first batch run if it's the beginning of processing
-        if pubsub_message.get("offset", 0) == 0 and total_items_processed > 0 :
-            db.collection(f"{firestore_collection_name}_metadata").document(dataset_id).set({
-                "initial_invocation_items_processed": total_items_processed,
-                "initial_invocation_successful_commits": successful_commits_in_summary,
-                "dataset_type": dataset_type,
-                "date_triggered": pubsub_message.get("date", datetime.now().strftime('%Y%m%d')),
-                "first_batch_timestamp": firestore.SERVER_TIMESTAMP
-            }, merge=True)
-
-        return {"status": "success", "items_processed_this_invocation": total_items_processed, "successful_commits_this_invocation": successful_commits_in_summary, "final_offset": current_offset}
+        return {"status": "success", "items_processed": total_items_processed, "results_summary": results_summary}
 
     except Exception as e_main:
         active_logger.error(f"Critical error in extract_metadata: {str(e_main)}", exc_info=True)
-        # Depending on Cloud Function retry policy, this might be re-invoked.
-        # If not, ensure some external monitoring catches this failure.
-        raise # Re-raise to mark the function execution as failed.
+        gcp_project_id_fallback = os.environ.get("GCP_PROJECT")
+        if 'pubsub_message' in locals() and pubsub_message.get("customer") and pubsub_message.get("project"):
+            current_gcp_project_id = gcp_project_id if 'gcp_project_id' in locals() and gcp_project_id else gcp_project_id_fallback
+            if current_gcp_project_id:
+                try:
+                    retry_payload = {
+                        "customer": pubsub_message.get("customer"),
+                        "project": pubsub_message.get("project"),
+                        "original_pubsub_message": pubsub_message,
+                        "error_message": str(e_main),
+                        "stage": "extract_metadata_critical",
+                        "retry_count": pubsub_message.get("retry_count", 0) + 1,
+                        "item_data": item_data if 'item_data' in locals() else None,
+                        "metadata": metadata if 'metadata' in locals() else None
+                    }
+                    if publisher_client is None:
+                        publisher_client = pubsub_v1.PublisherClient()
+                    publisher_client.publish(
+                        publisher_client.topic_path(current_gcp_project_id, RETRY_TOPIC_NAME),
+                        json.dumps(retry_payload, default=str).encode('utf-8')
+                    )
+                    active_logger.info("Published critical error to retry topic.")
+                except Exception as e_retry_pub:
+                    active_logger.error(f"Failed to publish critical error to retry topic: {str(e_retry_pub)}")
+            else:
+                active_logger.error("GCP Project ID for error reporting not found.")
+        raise
