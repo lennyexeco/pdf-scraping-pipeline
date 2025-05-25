@@ -44,6 +44,10 @@ check_requirements() {
       echo "Warning: google-cloud-logging missing in $req_file for $function_name. Adding it." | tee -a "$LOG_FILE"
       echo "google-cloud-logging==3.10.0" >> "$req_file"
     fi
+    if [ "$function_name" = "retry-pipeline" ] && ! grep -q "google-cloud-aiplatform" "$req_file"; then
+      echo "Warning: google-cloud-aiplatform missing in $req_file for $function_name. Adding it." | tee -a "$LOG_FILE"
+      echo "google-cloud-aiplatform==1.40.0" >> "$req_file"
+    fi
   else
     echo "Error: requirements.txt not found in $req_file for $function_name." | tee -a "$LOG_FILE"
     exit 1
@@ -56,6 +60,8 @@ deploy_single_function() {
   local entry_point_name="$2"
   local trigger_topic_name="$3"
   local function_code_subdir="$4"
+  local memory="$5"
+  local timeout="$6"
   local function_log_file="$LOG_DIR/${function_name}_$(date +%Y%m%d_%H%M%S).log"
 
   echo "Preparing deployment for $function_name..." | tee -a "$LOG_FILE"
@@ -105,12 +111,12 @@ deploy_single_function() {
     cp "$req_file" "$staging_dir/"
     check_requirements "$req_file" "$function_name"
   else
-    echo "Warning: requirements.txt not found in $req_file, proceeding without it." | tee -a "$LOG_FILE" "$function_log_file"
+    echo "Error: requirements.txt not found in $req_file for $function_name." | tee -a "$LOG_FILE" "$function_log_file"
+    exit 1
   fi
 
   echo "Deploying $function_name..." | tee -a "$LOG_FILE"
   echo "Deploying $function_name..." >> "$function_log_file"
-  # Run deployment and capture output
   if ! gcloud functions deploy "$function_name" \
     --runtime=python39 \
     --trigger-topic="$trigger_topic_name" \
@@ -119,7 +125,8 @@ deploy_single_function() {
     --project="$PROJECT_ID" \
     --region="$REGION" \
     --service-account="$SERVICE_ACCOUNT" \
-    --timeout=540s \
+    --timeout="${timeout}s" \
+    --memory="$memory" \
     --no-gen2 \
     >> "$function_log_file" 2>&1; then
     echo "Error: Deployment of $function_name failed. Check $function_log_file for details." | tee -a "$LOG_FILE"
@@ -146,13 +153,21 @@ fi
 # Check quota project
 check_quota_project
 
-# Deploy Cloud Functions
-# deploy_single_function "extract-metadata" "extract_metadata" "process-data" "functions/extract_metadata"
-# deploy_single_function "store-html" "store_html" "store-html" "functions/store_html"
-# deploy_single_function "fix-image-urls" "fix_image_urls" "fix-image-urls" "functions/fix_image_urls"
-# deploy_single_function "generate-xml" "generate_xml" "generate-xml" "functions/generate_xml"
-deploy_single_function "generate-reports" "generate_reports" "generate-reports" "functions/generate_reports"
-# deploy_single_function "sftp-upload" "sftp_upload" "sftp-upload" "functions/sftp_upload"
+# Create necessary Pub/Sub topics if they don't exist
+echo "Checking for Pub/Sub topics..." | tee -a "$LOG_FILE"
+for topic in process-data store-html fix-image-urls generate-xml generate-reports retry-pipeline; do
+  if ! gcloud pubsub topics describe "$topic" --project="$PROJECT_ID" >> "$LOG_FILE" 2>&1; then
+    echo "Creating $topic topic..." | tee -a "$LOG_FILE"
+    gcloud pubsub topics create "$topic" --project="$PROJECT_ID" >> "$LOG_FILE" 2>&1
+  fi
+done
 
-# echo "All Cloud Functions deployed successfully!" | tee -a "$LOG_FILE"
-echo "extract-metadata Cloud Function deployment process completed." | tee -a "$LOG_FILE"
+# Deploy Cloud Functions
+# deploy_single_function "extract-metadata" "extract_metadata" "process-data" "functions/extract_metadata" "512MB" "540"
+# deploy_single_function "fix-image-urls" "fix_image_urls" "fix-image-urls" "functions/fix_image_urls" "512MB" "540"
+# deploy_single_function "store-html" "store_html" "store-html" "functions/store_html" "512MB" "540"
+# deploy_single_function "generate-xml" "generate_xml" "generate-xml" "functions/generate_xml" "512MB" "540"
+# deploy_single_function "generate-reports" "generate_reports" "generate-reports" "functions/generate_reports" "512MB" "540"
+deploy_single_function "retry-pipeline" "retry_pipeline" "retry-pipeline" "functions/retry_pipeline" "1GB" "300"
+
+echo "All Cloud Functions deployed successfully!" | tee -a "$LOG_FILE"
