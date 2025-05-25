@@ -1,0 +1,135 @@
+{
+  "project_id": "germany_federal_law",
+  "customer_id": "harvey",
+  "apify_contents_dataset_id": "fgWmr3HH87n3koggB",
+  "apify_search_results_dataset_id": "cd0PtExfw5D14Y1Lp",
+  "gcs_bucket": "harvey-germany",
+  "gcs_temp_html_path": "temp_html/germany_federal_law/<date>",
+  "firestore_collection": "germany_federal_law",
+  "search_results_collection": "germany_search_results",
+  "firestore_database_id": "harvey-au",
+  "required_fields": [
+    "Law-ID",
+    "Abbreviation",
+    "fullname",
+    "URL",
+    "pdfLink",
+    "Ausfertigungsdatum",
+    "Vollzitat",
+    "Filename"
+  ],
+  "search_required_fields": [
+    "Abbreviation",
+    "main_url",
+    "fullname",
+    "pdfLink",
+    "raw_text",
+    "Filename"
+  ],
+  "field_mappings": {
+    "Law-ID": {
+      "source": "generate_law_id(project_id, sequence_number)",
+      "type": "computed"
+    },
+    "Abbreviation": {
+      "source": "abbreviation",
+      "type": "direct"
+    },
+    "fullname": {
+      "source": "fullName || full_name",
+      "type": "direct"
+    },
+    "URL": {
+      "source": "htmlUrl || url || mainUrl",
+      "type": "direct"
+    },
+    "pdfLink": {
+      "source": "pdfLink || pdf_link",
+      "type": "direct"
+    },
+    "Ausfertigungsdatum": {
+      "source": "extract_date_from_html(htmlContent || rawText)",
+      "type": "computed"
+    },
+    "Vollzitat": {
+      "source": "rawText",
+      "type": "direct"
+    },
+    "Filename": {
+      "source": "extract_title_from_html(htmlContent) || Title || fullName",
+      "type": "computed"
+    },
+    "Content": {
+      "source": "htmlContent || rawText",
+      "type": "direct",
+      "store_in_gcs": true,
+      "gcs_field": "html_path"
+    },
+    "main_url": {
+      "source": "mainUrl",
+      "type": "direct"
+    },
+    "raw_text": {
+      "source": "rawText",
+      "type": "direct"
+    }
+  },
+  "gcs_search_results_path": "search_results/germany_federal_law/<date>",
+  "image_url_fix": {
+    "base_url": "https://www.gesetze-im-internet.de",
+    "regex_pattern": "(<img\\s+[^>]*?src=\")(/[^\"]*?)(\"[^>]*?>)",
+    "gcs_pending_path": "pending/germany_federal_law/<date>",
+    "gcs_fixed_path": "fixed/germany_federal_law/<date>",
+    "gcs_search_results_pending_path": "search_results/germany_federal_law/<date>",
+    "gcs_search_results_fixed_path": "search_results_fixed/germany_federal_law/<date>"
+  },
+  "xml_structure": {
+    "root_tag": "GermanyFederalLaw",
+    "filename_field": "fullname",
+    "gcs_xml_path": "delivered_xml/germany_federal_law/20250524",
+    "indent": "  ",
+    "declaration": true,
+    "fields": [
+      {"tag": "Date", "source": "Ausfertigungsdatum", "cdata": false},
+      {"tag": "LawID", "source": "Law-ID", "cdata": false},
+      {"tag": "Title", "source": "fullname", "cdata": false},
+      {"tag": "Content", "source": "fixed_html_content", "cdata": true}
+    ]
+  },
+  "report_config": {
+    "gcs_report_path": "reports/germany_federal_law/<date>",
+    "fields": [
+      "Law-ID",
+      "Abbreviation",
+      "fullname",
+      "URL",
+      "pdfLink",
+      "Ausfertigungsdatum",
+      "Vollzitat",
+      "Filename",
+      "html_path",
+      "xml_path",
+      "xml_status",
+      "images_fixed",
+      "xml_generated_at"
+    ],
+    "search_results_fields": [
+      "Abbreviation",
+      "main_url",
+      "fullname",
+      "pdfLink",
+      "raw_text",
+      "Filename",
+      "html_path"
+    ]
+  },
+  "apify_api_key_secret": "apify-api-key",
+  "batch_size": 10,
+  "pipeline_flow": [
+    "extract_metadata",
+    "fix_image_urls",
+    "store_html",
+    "generate_xml"
+  ],
+  "enable_llm_html_field_detection": false
+}
