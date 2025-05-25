@@ -7,8 +7,8 @@ from google.cloud import firestore, pubsub_v1, storage
 from apify_client import ApifyClient
 from src.common.utils import generate_url_hash, setup_logging
 from src.common.config import load_customer_config, load_project_config, get_secret
-from src.common.helpers import generate_law_id, find_url_in_item, get_mapped_field, sanitize_error_message, analyze_error_with_vertex_ai
-from datetime import datetime
+from src.common.helpers import generate_law_id, find_url_in_item, get_mapped_field, sanitize_error_message, analyze_error_with_vertex_ai, validate_html_content
+from datetime import datetime, timezone
 import functions_framework
 
 logger = logging.getLogger(__name__)
@@ -21,26 +21,13 @@ RETRY_BACKOFF = 5
 MAX_RETRIES = 3
 MAX_DOCUMENT_SIZE = 1_000_000
 
-def validate_html_content(content, logger_instance):
-    """Validate and normalize HTML content encoding."""
-    if not content:
-        return None
-    try:
-        if isinstance(content, bytes):
-            try:
-                content = content.decode('utf-8')
-            except UnicodeDecodeError:
-                try:
-                    content = content.decode('latin-1')
-                    logger_instance.warning("HTML content decoded with latin-1 fallback.")
-                except UnicodeDecodeError:
-                    content = content.decode('utf-8', errors='replace')
-                    logger_instance.warning("HTML content decoded with error replacement.")
-        content.encode('utf-8')
-        return content
-    except Exception as e:
-        logger_instance.error(f"Failed to validate HTML content: {str(e)}")
-        return None
+@firestore.transactional
+def update_sequence(transaction, sequence_doc_ref, sequence_number):
+    """Update sequence number atomically."""
+    snapshot = sequence_doc_ref.get(transaction=transaction)
+    current_sequence = snapshot.get("last_sequence", 0) if snapshot.exists else 0
+    if sequence_number > current_sequence + 1:
+        transaction.set(sequence_doc_ref, {"last_sequence": sequence_number - 1}, merge=True)
 
 @functions_framework.cloud_event
 def retry_pipeline(cloud_event):
@@ -48,7 +35,7 @@ def retry_pipeline(cloud_event):
     try:
         pubsub_message_data_encoded = cloud_event.data["message"]["data"]
         data = json.loads(base64.b64decode(pubsub_message_data_encoded).decode("utf-8"))
-        active_logger.info(f"Decoded retry message: {data}")
+        active_logger.info(f"Decoded retry message: {json.dumps(data, default=str)}")
 
         customer_id = data.get("customer")
         project_id_config_name = data.get("project")
@@ -99,9 +86,10 @@ def retry_pipeline(cloud_event):
             return {"status": "error", "message": "No error document found"}
 
         error_data = error_doc.to_dict()
-        original_item = data.get("item_data_snapshot") or error_data.get("original_item") or error_data.get("original_data") or {}
+        original_item = data.get("item_data_snapshot") or error_data.get("original_item") or error_data.get("original_item_excerpt") or error_data.get("original_data") or {}
         error_message = error_data.get("error", "No error message recorded")
         dataset_fields = list(original_item.keys()) if isinstance(original_item, dict) else []
+        active_logger.debug(f"Original item fields: {dataset_fields}")
 
         if retry_count >= MAX_RETRIES:
             active_logger.error(f"Max retries ({MAX_RETRIES}) reached for identifier '{identifier}' at stage '{stage}'")
@@ -217,6 +205,7 @@ def retry_pipeline(cloud_event):
                         else:
                             raise
                 return {"status": "failed", "message": "Missing original_item"}
+
             try:
                 content_url, _ = find_url_in_item(original_item, active_logger)
                 if not content_url:
@@ -224,8 +213,25 @@ def retry_pipeline(cloud_event):
                     publish_for_next_retry("No valid URL found", original_item)
                     return {"status": "retry_queued", "identifier": identifier, "stage": stage, "message": "No valid URL found"}
 
+                # Re-fetch from Apify if recheck_metadata is suggested
+                if recheck_metadata_flag and apify_contents_dataset_id:
+                    apify_key = get_secret(project_config.get("apify_api_key_secret", "apify-api-key"), gcp_project_id)
+                    apify_client = ApifyClient(apify_key)
+                    try:
+                        items = apify_client.dataset(apify_contents_dataset_id).list_items(
+                            offset=0, limit=APIFY_BATCH_SIZE, fields=["url", "htmlContent", "html", "content"]
+                        ).items
+                        for item in items:
+                            item_url, _ = find_url_in_item(item, active_logger)
+                            if item_url and generate_url_hash(item_url) == identifier:
+                                original_item.update(item)
+                                active_logger.info(f"Updated original_item for {identifier} from Apify dataset")
+                                break
+                    except Exception as e_apify:
+                        active_logger.warning(f"Failed to re-fetch from Apify for {identifier}: {str(e_apify)}")
+
                 metadata = {
-                    "scrape_date": original_item.get("extractionTimestamp", firestore.SERVER_TIMESTAMP),
+                    "scrape_date": original_item.get("extractionTimestamp", datetime.now(timezone.utc)),
                     "processed_at_extract_metadata_retry": firestore.SERVER_TIMESTAMP,
                     "retry_attempt_count": next_retry_count,
                     "main_url": content_url,
@@ -234,6 +240,7 @@ def retry_pipeline(cloud_event):
 
                 fields_to_process = search_required_fields if dataset_type == "search_results" else required_fields
                 sequence_doc_ref = db.collection(f"{firestore_collection_name}_metadata").document("sequence")
+                transaction = db.transaction()
                 sequence_doc = sequence_doc_ref.get()
                 sequence_number = sequence_doc.to_dict().get("last_sequence", 0) + 1 if sequence_doc.exists else 1
 
@@ -244,6 +251,9 @@ def retry_pipeline(cloud_event):
                     )
                     if value is not None and value != "Not Available":
                         metadata[field_name] = value
+                        active_logger.debug(f"Mapped field '{field_name}' to value: {value}")
+                    else:
+                        active_logger.warning(f"Field '{field_name}' not mapped for {identifier}")
                     if field_name == "Law-ID" and metadata.get("Law-ID") != "Not Available":
                         sequence_number += 1
 
@@ -258,6 +268,9 @@ def retry_pipeline(cloud_event):
                 if html_content:
                     html_content = validate_html_content(html_content, active_logger)
                     if html_content:
+                        if truncate_content_flag and len(html_content.encode('utf-8')) > MAX_DOCUMENT_SIZE:
+                            html_content = html_content[:MAX_DOCUMENT_SIZE // 2]
+                            active_logger.info(f"Truncated HTML content for {identifier} to {len(html_content.encode('utf-8'))} bytes")
                         safe_project_id_path = "".join(c if c.isalnum() else '_' for c in project_id_config_name)
                         date_str = datetime.now().strftime('%Y%m%d')
                         gcs_temp_html_path = f"temp_html/{safe_project_id_path}/{date_str}"
@@ -327,18 +340,7 @@ def retry_pipeline(cloud_event):
                                 return {"status": "retry_queued", "identifier": identifier, "stage": stage, "message": f"Firestore update failed: {str(e_update)}"}
 
                 if sequence_number > 1:
-                    for attempt in range(MAX_FIRESTORE_RETRIES):
-                        try:
-                            sequence_doc_ref.set({"last_sequence": sequence_number - 1}, merge=True)
-                            break
-                        except Exception as e_update:
-                            active_logger.warning(f"Sequence update failed on attempt {attempt + 1}: {str(e_update)}")
-                            if attempt < MAX_FIRESTORE_RETRIES - 1:
-                                time.sleep(RETRY_BACKOFF * (2 ** attempt))
-                            else:
-                                active_logger.error(f"Max retries reached for sequence update: {str(e_update)}")
-                                publish_for_next_retry(f"Sequence update failed: {str(e_update)}", original_item)
-                                return {"status": "retry_queued", "identifier": identifier, "stage": stage, "message": f"Sequence update failed: {str(e_update)}"}
+                    update_sequence(transaction, sequence_doc_ref, sequence_number)
 
                 publisher.publish(
                     publisher.topic_path(gcp_project_id, "fix-image-urls"),
@@ -350,7 +352,8 @@ def retry_pipeline(cloud_event):
                         "identifier": identifier,
                         "main_url": content_url,
                         "html_path": html_path_gcs,
-                        "date": datetime.now().strftime('%Y%m%d')
+                        "date": datetime.now().strftime('%Y%m%d'),
+                        "apify_dataset_id_source": dataset_id
                     }).encode('utf-8')
                 )
 
@@ -372,7 +375,7 @@ def retry_pipeline(cloud_event):
                 return {"status": "success", "identifier": identifier, "stage": stage, "message": "extract_metadata retried successfully"}
 
             except Exception as e:
-                active_logger.error(f"Retry attempt {next_retry_count} failed for '{identifier}' at 'extract_metadata': {str(e)}")
+                active_logger.error(f"Retry attempt {next_retry_count} failed for '{identifier}' at 'extract_metadata': {str(e)}", exc_info=True)
                 publish_for_next_retry(str(e), original_item)
                 return {"status": "retry_queued", "identifier": identifier, "stage": stage, "message": f"extract_metadata retry failed: {str(e)}"}
 
@@ -432,7 +435,7 @@ def retry_pipeline(cloud_event):
                 return {"status": "success", "identifier": identifier, "stage": stage, "message": "fix_image_urls retried successfully"}
 
             except Exception as e:
-                active_logger.error(f"Retry attempt {next_retry_count} failed for '{identifier}' at 'fix_image_urls': {str(e)}")
+                active_logger.error(f"Retry attempt {next_retry_count} failed for '{identifier}' at 'fix_image_urls': {str(e)}", exc_info=True)
                 publish_for_next_retry(str(e))
                 return {"status": "retry_queued", "identifier": identifier, "stage": stage, "message": f"fix_image_urls retry failed: {str(e)}"}
 
@@ -467,9 +470,26 @@ def retry_pipeline(cloud_event):
                         publish_for_next_retry("HTML file not found in GCS")
                         return {"status": "retry_queued", "identifier": identifier, "stage": stage, "message": "HTML file not found in GCS"}
                 except Exception as e_gcs:
-                    active_logger.error(f"Failed to fetch HTML from GCS for {identifier}: {str(e_gcs)}")
+                    active_logger.error(f"Failed to fetch HTML from GCS for {identifier}: {str(e_gcs)}", exc_info=True)
                     publish_for_next_retry(f"GCS fetch failed: {str(e_gcs)}")
                     return {"status": "retry_queued", "identifier": identifier, "stage": stage, "message": f"GCS fetch failed: {str(e_gcs)}"}
+
+                # Re-fetch augmentation data if recheck_metadata is suggested
+                if recheck_metadata_flag and apify_search_results_dataset_id:
+                    apify_key = get_secret(project_config.get("apify_api_key_secret", "apify-api-key"), gcp_project_id)
+                    apify_client = ApifyClient(apify_key)
+                    try:
+                        items = apify_client.dataset(apify_search_results_dataset_id).list_items(
+                            offset=0, limit=APIFY_BATCH_SIZE, fields=["url", "pdfLink", "pdf_link"]
+                        ).items
+                        for item in items:
+                            item_url, _ = find_url_in_item(item, active_logger)
+                            if item_url and generate_url_hash(item_url) == identifier:
+                                original_item.update(item)
+                                active_logger.info(f"Updated original_item for {identifier} from Apify search dataset")
+                                break
+                    except Exception as e_apify:
+                        active_logger.warning(f"Failed to re-fetch from Apify for {identifier}: {str(e_apify)}")
 
                 publisher.publish(
                     publisher.topic_path(gcp_project_id, "store-html"),
@@ -480,7 +500,7 @@ def retry_pipeline(cloud_event):
                         "dataset_type": dataset_type,
                         "identifier": identifier,
                         "main_url": main_url,
-                        "fixed_html_content": fixed_html_content[:1000000] if truncate_content_flag else fixed_html_content,
+                        "fixed_html_content": fixed_html_content[:500000] if truncate_content_flag else fixed_html_content,
                         "images_fixed_count": doc_data.get("images_fixed_count", 0),
                         "date": datetime.now().strftime('%Y%m%d'),
                         "apify_dataset_id_source": dataset_id,
@@ -506,7 +526,7 @@ def retry_pipeline(cloud_event):
                 return {"status": "success", "identifier": identifier, "stage": stage, "message": "store_html retried successfully"}
 
             except Exception as e:
-                active_logger.error(f"Retry attempt {next_retry_count} failed for '{identifier}' at 'store_html': {str(e)}")
+                active_logger.error(f"Retry attempt {next_retry_count} failed for '{identifier}' at 'store_html': {str(e)}", exc_info=True)
                 publish_for_next_retry(str(e))
                 return {"status": "retry_queued", "identifier": identifier, "stage": stage, "message": f"store_html retry failed: {str(e)}"}
 
@@ -566,7 +586,7 @@ def retry_pipeline(cloud_event):
                 return {"status": "success", "identifier": identifier, "stage": stage, "message": "generate_xml retried successfully"}
 
             except Exception as e:
-                active_logger.error(f"Retry attempt {next_retry_count} failed for '{identifier}' at 'generate_xml': {str(e)}")
+                active_logger.error(f"Retry attempt {next_retry_count} failed for '{identifier}' at 'generate_xml': {str(e)}", exc_info=True)
                 publish_for_next_retry(str(e))
                 return {"status": "retry_queued", "identifier": identifier, "stage": stage, "message": f"generate_xml retry failed: {str(e)}"}
 
@@ -603,7 +623,7 @@ def retry_pipeline(cloud_event):
                 return {"status": "success", "identifier": identifier, "stage": stage, "message": "generate_reports retried successfully"}
 
             except Exception as e:
-                active_logger.error(f"Retry attempt {next_retry_count} failed for '{identifier}' at 'generate_reports': {str(e)}")
+                active_logger.error(f"Retry attempt {next_retry_count} failed for '{identifier}' at 'generate_reports': {str(e)}", exc_info=True)
                 publish_for_next_retry(str(e))
                 return {"status": "retry_queued", "identifier": identifier, "stage": stage, "message": f"generate_reports retry failed: {str(e)}"}
 

@@ -167,7 +167,7 @@ done
 # deploy_single_function "fix-image-urls" "fix_image_urls" "fix-image-urls" "functions/fix_image_urls" "512MB" "540"
 # deploy_single_function "store-html" "store_html" "store-html" "functions/store_html" "512MB" "540"
 # deploy_single_function "generate-xml" "generate_xml" "generate-xml" "functions/generate_xml" "512MB" "540"
-# deploy_single_function "generate-reports" "generate_reports" "generate-reports" "functions/generate_reports" "512MB" "540"
-deploy_single_function "retry-pipeline" "retry_pipeline" "retry-pipeline" "functions/retry_pipeline" "1GB" "300"
+deploy_single_function "generate-reports" "generate_reports" "generate-reports" "functions/generate_reports" "512MB" "540"
+# deploy_single_function "retry-pipeline" "retry_pipeline" "retry-pipeline" "functions/retry_pipeline" "1GB" "300"
 
 echo "All Cloud Functions deployed successfully!" | tee -a "$LOG_FILE"

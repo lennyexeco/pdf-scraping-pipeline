@@ -6,7 +6,7 @@ import time
 from google.cloud import firestore, storage, pubsub_v1
 from src.common.utils import setup_logging
 from src.common.config import load_customer_config, load_project_config
-from src.common.helpers import get_mapped_field, sanitize_error_message
+from src.common.helpers import get_mapped_field, sanitize_error_message, serialize_firestore_doc
 from datetime import datetime
 import functions_framework
 import pandas as pd
@@ -16,16 +16,6 @@ RETRY_TOPIC_NAME = "retry-pipeline"
 MAX_GCS_RETRIES = 3
 MAX_FIRESTORE_RETRIES = 3
 RETRY_BACKOFF = 5  # seconds
-
-def serialize_firestore_doc(data):
-    """Convert Firestore document data to JSON-serializable format."""
-    if isinstance(data, dict):
-        return {k: serialize_firestore_doc(v) for k, v in data.items()}
-    elif isinstance(data, list):
-        return [serialize_firestore_doc(item) for item in data]
-    elif isinstance(data, datetime):
-        return data.isoformat()
-    return data
 
 @functions_framework.cloud_event
 def generate_reports(cloud_event):
@@ -43,7 +33,7 @@ def generate_reports(cloud_event):
         date = data.get('date', datetime.now().strftime('%Y%m%d'))
 
         if not all([customer_id, project_id, dataset_id, dataset_type, date]):
-            raise ValueError("Missing required fields")
+            raise ValueError(f"Missing required fields: customer={customer_id}, project={project_id}, dataset_id={dataset_id}, dataset_type={dataset_type}, date={date}")
 
         active_logger = setup_logging(customer_id, project_id)
         active_logger.info(f"Generating report for dataset_id: {dataset_id}, type: {dataset_type}, date: {date}")
@@ -63,7 +53,7 @@ def generate_reports(cloud_event):
         error_collection = f"{firestore_collection}_errors"
 
         if not all([bucket_name, firestore_collection, report_config]):
-            raise ValueError("Missing required configuration")
+            raise ValueError("Missing required configuration: gcs_bucket, firestore_collection, or report_config")
 
         storage_client = storage.Client(project=gcp_project_id)
         bucket = storage_client.bucket(bucket_name)
@@ -82,40 +72,87 @@ def generate_reports(cloud_event):
         end_date = start_date.replace(hour=23, minute=59, second=59)
 
         report_data = []
-        for attempt in range(MAX_FIRESTORE_RETRIES):
-            try:
-                docs = db.collection(collection).where('dataset_id_source', '==', dataset_id).where('scrape_date', '>=', start_date).where('scrape_date', '<=', end_date).stream()
-                break
-            except Exception as e:
-                active_logger.warning(f"Firestore query failed on attempt {attempt + 1}: {str(e)}")
-                if attempt < MAX_FIRESTORE_RETRIES - 1:
-                    time.sleep(RETRY_BACKOFF * (2 ** attempt))
-                else:
-                    active_logger.error(f"Max retries reached for Firestore query: {str(e)}")
-                    raise
+        try:
+            for attempt in range(MAX_FIRESTORE_RETRIES):
+                try:
+                    query = db.collection(collection).where('dataset_id_source', '==', dataset_id).where('scrape_date', '>=', start_date).where('scrape_date', '<=', end_date)
+                    docs = query.stream()
+                    break
+                except Exception as e:
+                    if "The query requires an index" in str(e):
+                        active_logger.error(f"Firestore query failed due to missing index: {str(e)}")
+                        index_url = str(e).split("You can create it here: ")[-1] if "You can create it here: " in str(e) else "unknown"
+                        active_logger.info(f"Create index at: {index_url}")
+                        publisher.publish(
+                            publisher.topic_path(gcp_project_id, RETRY_TOPIC_NAME),
+                            json.dumps({
+                                "customer": customer_id,
+                                "project": project_id,
+                                "dataset_id": dataset_id,
+                                "dataset_type": dataset_type,
+                                "identifier": f"report_{dataset_type}_{datetime.now().strftime('%Y%m%d_%H%M%S')}",
+                                "stage": "generate_reports",
+                                "retry_count": data.get("retry_count", 0) + 1,
+                                "item_data_snapshot": serialize_firestore_doc(data)
+                            }).encode('utf-8')
+                        )
+                        return {
+                            'status': 'error',
+                            'message': f"Missing Firestore index. Create at: {index_url}",
+                            'processed': 0,
+                            'success': 0
+                        }
+                    active_logger.warning(f"Firestore query failed on attempt {attempt + 1}: {str(e)}")
+                    if attempt < MAX_FIRESTORE_RETRIES - 1:
+                        time.sleep(RETRY_BACKOFF * (2 ** attempt))
+                    else:
+                        active_logger.error(f"Max retries reached for Firestore query: {str(e)}")
+                        raise
 
-        for doc in docs:
-            doc_data = doc.to_dict()
-            doc_id = doc.id
-            error_docs = db.collection(error_collection).where('identifier', '==', doc_id).stream()
-            error_messages = [error_doc.to_dict().get('error', 'Unknown error') for error_doc in error_docs]
-            errors = '; '.join(error_messages) if error_messages else 'None'
+            for doc in docs:
+                doc_data = doc.to_dict()
+                doc_id = doc.id
+                error_docs = db.collection(error_collection).where('identifier', '==', doc_id).stream()
+                error_messages = [error_doc.to_dict().get('error', 'Unknown error') for error_doc in error_docs]
+                errors = '; '.join(error_messages) if error_messages else 'None'
 
-            row = {'identifier': doc_id, 'errors': errors}
-            for field in report_columns:
-                if field in ['identifier', 'errors']:
-                    continue
-                # Use get_mapped_field to resolve field value dynamically
-                value = get_mapped_field(doc_data, field, field_mappings, logger_instance=active_logger)
-                if value is None:
-                    value = doc_data.get(field, 'Not Available')
-                    active_logger.debug(f"Field {field} not found in mappings, using direct value: {value}")
-                row[field] = str(value)
-            report_data.append(row)
+                row = {'identifier': doc_id, 'errors': errors}
+                for field in report_columns:
+                    if field in ['identifier', 'errors']:
+                        continue
+                    value = get_mapped_field(doc_data, field, field_mappings, logger_instance=active_logger)
+                    if value is None or value == "Not Available":
+                        value = doc_data.get(field, 'Not Available')
+                        active_logger.debug(f"Field '{field}' not found in mappings for {doc_id}, using direct value: {value}")
+                    row[field] = str(value)
+                report_data.append(row)
+
+        except Exception as e:
+            active_logger.error(f"Failed to process Firestore query: {str(e)}", exc_info=True)
+            timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+            publisher.publish(
+                publisher.topic_path(gcp_project_id, RETRY_TOPIC_NAME),
+                json.dumps({
+                    "customer": customer_id,
+                    "project": project_id,
+                    "dataset_id": dataset_id,
+                    "dataset_type": dataset_type,
+                    "identifier": f"report_{dataset_type}_{timestamp}",
+                    "stage": "generate_reports",
+                    "retry_count": data.get("retry_count", 0) + 1,
+                    "item_data_snapshot": serialize_firestore_doc(data)
+                }).encode('utf-8')
+            )
+            return {
+                'status': 'error',
+                'message': f"Firestore query failed: {str(e)}",
+                'processed': 0,
+                'success': 0
+            }
 
         timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
         safe_project_id = "".join(c if c.isalnum() else '_' for c in project_id)
-        full_report_path = report_config.get('gcs_report_path', f"reports/{safe_project_id}/<date>").replace('<date>', date) + f"/report_{dataset_type}_{timestamp}.csv"
+        full_report_path = report_config.get('gcs_report_path', f"reports/{safe_project_id}/<date>").replace('<date>', date) + f"/report_{dataset_id}_{dataset_type}_{timestamp}.csv"
         blob = bucket.blob(full_report_path)
 
         if not report_data:
@@ -134,7 +171,7 @@ def generate_reports(cloud_event):
                         else:
                             raise Exception(f"Max retries reached for GCS upload: {str(e)}")
             except Exception as e:
-                active_logger.error(f"Failed to upload empty report to GCS: {str(e)}")
+                active_logger.error(f"Failed to upload empty report to GCS: {str(e)}", exc_info=True)
                 publisher.publish(
                     publisher.topic_path(gcp_project_id, RETRY_TOPIC_NAME),
                     json.dumps({
@@ -144,7 +181,7 @@ def generate_reports(cloud_event):
                         "dataset_type": dataset_type,
                         "identifier": f"report_{dataset_type}_{timestamp}",
                         "stage": "generate_reports",
-                        "retry_count": 0,
+                        "retry_count": data.get("retry_count", 0) + 1,
                         "item_data_snapshot": serialize_firestore_doc(data)
                     }).encode('utf-8')
                 )
@@ -170,7 +207,7 @@ def generate_reports(cloud_event):
                     else:
                         raise Exception(f"Max retries reached for GCS upload: {str(e)}")
         except Exception as e:
-            active_logger.error(f"Failed to upload report to GCS: {str(e)}")
+            active_logger.error(f"Failed to upload report to GCS: {str(e)}", exc_info=True)
             publisher.publish(
                 publisher.topic_path(gcp_project_id, RETRY_TOPIC_NAME),
                 json.dumps({
@@ -180,7 +217,7 @@ def generate_reports(cloud_event):
                     "dataset_type": dataset_type,
                     "identifier": f"report_{dataset_type}_{timestamp}",
                     "stage": "generate_reports",
-                    "retry_count": 0,
+                    "retry_count": data.get("retry_count", 0) + 1,
                     "item_data_snapshot": serialize_firestore_doc(data)
                 }).encode('utf-8')
             )
@@ -202,6 +239,7 @@ def generate_reports(cloud_event):
     except Exception as e:
         active_logger.error(f"Critical error in generate_reports: {str(e)}", exc_info=True)
         timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+        gcp_project_id = os.environ.get("GCP_PROJECT") if 'gcp_project_id' not in locals() else gcp_project_id
         publisher = pubsub_v1.PublisherClient()
         publisher.publish(
             publisher.topic_path(gcp_project_id, RETRY_TOPIC_NAME),
@@ -212,7 +250,7 @@ def generate_reports(cloud_event):
                 "dataset_type": dataset_type if 'dataset_type' in locals() else 'unknown',
                 "identifier": f"report_{dataset_type}_{timestamp}" if 'dataset_type' in locals() else f"report_unknown_{timestamp}",
                 "stage": "generate_reports",
-                "retry_count": 0,
+                "retry_count": data.get("retry_count", 0) + 1 if 'data' in locals() else 0,
                 "item_data_snapshot": serialize_firestore_doc(data) if 'data' in locals() else None
             }).encode('utf-8')
         )
