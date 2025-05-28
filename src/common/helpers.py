@@ -386,3 +386,14 @@ def serialize_firestore_doc(data):
     elif isinstance(data, datetime):
         return data.isoformat()
     return data
+
+
+def sanitize_filename(name, fallback_id=None, logger_instance=None):
+    """Sanitize a string to be a safe filename."""
+    sanitized = re.sub(r'[^\w\-_\. ]', '_', name)
+    sanitized = sanitized.strip().replace(' ', '_')
+    if not sanitized:
+        sanitized = fallback_id or "file"
+    if logger_instance:
+        logger_instance.info(f"Sanitized filename: {sanitized}")
+    return sanitized

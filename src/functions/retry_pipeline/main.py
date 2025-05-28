@@ -3,661 +3,325 @@ import base64
 import logging
 import os
 import time
+import requests # Added for potential re-scraping attempts if suggested by LLM
+
 from google.cloud import firestore, pubsub_v1, storage
-from apify_client import ApifyClient
+
 from src.common.utils import generate_url_hash, setup_logging
-from src.common.config import load_customer_config, load_project_config, get_secret
-from src.common.helpers import generate_law_id, find_url_in_item, get_mapped_field, sanitize_error_message, analyze_error_with_vertex_ai, validate_html_content
+# Updated import to include load_dynamic_site_config
+from src.common.config import load_customer_config, load_project_config, get_secret, load_dynamic_site_config
+from src.common.helpers import (
+    generate_law_id, find_url_in_item, get_mapped_field,
+    sanitize_error_message, analyze_error_with_vertex_ai,
+    validate_html_content
+)
 from datetime import datetime, timezone
 import functions_framework
 
 logger = logging.getLogger(__name__)
 
-APIFY_BATCH_SIZE = int(os.environ.get("APIFY_BATCH_SIZE", 50))
-RETRY_TOPIC_NAME = "retry-pipeline"
-MAX_API_RETRIES = 3
+# Constants for Pub/Sub topics
+INGEST_CATEGORY_URLS_TOPIC_NAME = "ingest-category-urls-topic"
+DISCOVER_MAIN_URLS_TOPIC_NAME = "discover-main-urls-topic"
+EXTRACT_INITIAL_METADATA_TOPIC_NAME = "extract-initial-metadata-topic"
+FETCH_CONTENT_TOPIC_NAME = "fetch-content-topic"
+GENERATE_XML_TOPIC_NAME = "generate-xml-topic"
+GENERATE_REPORTS_TOPIC_NAME = "generate-reports-topic"
+RETRY_TOPIC_NAME = "retry-pipeline" # Self-reference
+
 MAX_FIRESTORE_RETRIES = 3
 RETRY_BACKOFF = 5
-MAX_RETRIES = 3
-MAX_DOCUMENT_SIZE = 1_000_000
+MAX_RETRIES = 3 # Max retries for an item in this function
+MAX_DOCUMENT_SIZE = 1_000_000 # 1MB, Firestore limit
+
 
 @firestore.transactional
-def update_sequence(transaction, sequence_doc_ref, sequence_number):
-    """Update sequence number atomically."""
+def update_sequence_in_transaction(transaction, sequence_doc_ref, new_sequence_number):
+    """
+    Atomically updates the sequence number in Firestore if the new number is greater.
+    """
     snapshot = sequence_doc_ref.get(transaction=transaction)
-    current_sequence = snapshot.get("last_sequence", 0) if snapshot.exists else 0
-    if sequence_number > current_sequence + 1:
-        transaction.set(sequence_doc_ref, {"last_sequence": sequence_number - 1}, merge=True)
+    last_sequence = 0
+    if snapshot.exists:
+        last_sequence = snapshot.to_dict().get("last_sequence", 0)
+
+    if new_sequence_number > last_sequence:
+        transaction.set(sequence_doc_ref, {"last_sequence": new_sequence_number}, merge=True)
+        logger.info(f"Updated sequence number to {new_sequence_number}")
+    elif new_sequence_number == last_sequence:
+        logger.info(f"Sequence number {new_sequence_number} already set.")
+    else: # new_sequence_number < last_sequence
+        logger.warning(f"Attempted to set sequence number {new_sequence_number} but current is {last_sequence}. No update made.")
+
 
 @functions_framework.cloud_event
 def retry_pipeline(cloud_event):
     active_logger = logger
+    publisher = None
+
     try:
         pubsub_message_data_encoded = cloud_event.data["message"]["data"]
         data = json.loads(base64.b64decode(pubsub_message_data_encoded).decode("utf-8"))
-        active_logger.info(f"Decoded retry message: {json.dumps(data, default=str)}")
+        # active_logger.info(f"Decoded retry message: {json.dumps(data, default=str)}") # Can be verbose
 
         customer_id = data.get("customer")
         project_id_config_name = data.get("project")
-        dataset_id = data.get("dataset_id")
-        dataset_type = data.get("dataset_type", "items")
+        original_input_id = data.get("original_input_id")
         identifier = data.get("identifier")
         stage = data.get("stage")
         retry_count = int(data.get("retry_count", 0))
+        main_url_from_payload = data.get("main_url") or data.get("item_data_snapshot", {}).get("main_url")
+        category_url_from_payload = data.get("category_url") or data.get("item_data_snapshot", {}).get("category_url")
 
-        if not all([customer_id, project_id_config_name, dataset_id, identifier, stage]):
-            active_logger.error(f"Missing required fields: customer={customer_id}, project={project_id_config_name}, dataset_id={dataset_id}, identifier={identifier}, stage={stage}")
-            raise ValueError("Missing required fields")
+        if not all([customer_id, project_id_config_name, identifier, stage]):
+            logger.error( # Use base logger if active_logger isn't set yet
+                f"Missing required fields: customer={customer_id}, project={project_id_config_name}, "
+                f"identifier={identifier}, stage={stage}"
+            )
+            raise ValueError("Missing required fields for retry.")
 
         active_logger = setup_logging(customer_id, project_id_config_name)
-        active_logger.info(f"Processing retry for identifier '{identifier}', stage '{stage}', retry count {retry_count}")
+        active_logger.info(
+            f"Processing retry for identifier '{identifier}', stage '{stage}', retry count {retry_count}. Message: {json.dumps(data, default=str)}"
+        )
 
         customer_config = load_customer_config(customer_id)
-        project_config = load_project_config(project_id_config_name)
+        # project_config is now loaded dynamically later, after db client is initialized
         gcp_project_id = customer_config.get("gcp_project_id", os.environ.get("GCP_PROJECT"))
-        if not gcp_project_id:
-            active_logger.error("GCP Project ID not found.")
-            raise ValueError("GCP Project ID not configured")
 
-        firestore_collection_name = project_config.get("firestore_collection")
-        search_results_collection_name = project_config.get("search_results_collection", f"{firestore_collection_name}_search_results")
-        firestore_db_id = project_config.get("firestore_database_id", "(default)")
-        gcs_bucket_name = project_config.get("gcs_bucket")
-        required_fields = project_config.get("required_fields", [])
-        search_required_fields = project_config.get("search_required_fields", [])
-        field_mappings = project_config.get("field_mappings", {})
-        error_collection_name = f"{firestore_collection_name}_errors"
-        apify_search_results_dataset_id = project_config.get("apify_search_results_dataset_id")
-        apify_contents_dataset_id = project_config.get("apify_contents_dataset_id")
+        if not gcp_project_id:
+            active_logger.error("GCP Project ID not found in customer config or environment.")
+            raise ValueError("GCP Project ID not configured.")
 
         db_options = {"project": gcp_project_id}
+        # Need project_config to get firestore_database_id *before* initializing db to pass it
+        # So, we load static config first for this, then load dynamic config.
+        static_project_config = load_project_config(project_id_config_name)
+        firestore_db_id = static_project_config.get("firestore_database_id", "(default)")
+
         if firestore_db_id != "(default)":
             db_options["database"] = firestore_db_id
         db = firestore.Client(**db_options)
+
+        # --- Load Dynamic/Merged Project Configuration ---
+        # This now uses your new load_dynamic_site_config function
+        project_config = load_dynamic_site_config(db, project_id_config_name, active_logger)
+        # -------------------------------------------------
+
+        firestore_collection_name = project_config.get("firestore_collection", static_project_config.get("firestore_collection"))
+        gcs_bucket_name = project_config.get("gcs_bucket", static_project_config.get("gcs_bucket"))
+        error_collection_name = f"{firestore_collection_name}_errors"
+
+        if not firestore_collection_name or not gcs_bucket_name:
+            active_logger.error("firestore_collection_name or gcs_bucket_name is missing from configuration.")
+            raise ValueError("Essential configuration (firestore_collection_name, gcs_bucket_name) missing.")
+
+
         storage_client = storage.Client(project=gcp_project_id)
-        bucket = storage_client.bucket(gcs_bucket_name)
+        # bucket = storage_client.bucket(gcs_bucket_name) # Initialize bucket object - not directly used here
         publisher = pubsub_v1.PublisherClient()
         retry_topic_path = publisher.topic_path(gcp_project_id, RETRY_TOPIC_NAME)
 
-        error_doc_ref = db.collection(error_collection_name).document(identifier)
+        error_doc_ref = db.collection(error_collection_name).document(str(identifier))
         error_doc = error_doc_ref.get()
+
         if not error_doc.exists:
-            active_logger.error(f"No error document found for identifier '{identifier}'")
-            return {"status": "error", "message": "No error document found"}
+            active_logger.error(f"No error document found for identifier '{identifier}' in '{error_collection_name}'. Cannot process retry.")
+            return {"status": "error", "message": "No error document found for identifier."}
 
         error_data = error_doc.to_dict()
-        original_item = data.get("item_data_snapshot") or error_data.get("original_item") or error_data.get("original_item_excerpt") or error_data.get("original_data") or {}
-        error_message = error_data.get("error", "No error message recorded")
-        dataset_fields = list(original_item.keys()) if isinstance(original_item, dict) else []
-        active_logger.debug(f"Original item fields: {dataset_fields}")
+        original_item_snapshot = data.get("item_data_snapshot") or error_data.get("original_item_snapshot") or {}
+        error_message_from_doc = error_data.get("error", "No error message recorded in error document.")
+        current_error_message = data.get("error_message", error_message_from_doc)
 
         if retry_count >= MAX_RETRIES:
-            active_logger.error(f"Max retries ({MAX_RETRIES}) reached for identifier '{identifier}' at stage '{stage}'")
-            for attempt in range(MAX_FIRESTORE_RETRIES):
-                try:
-                    error_doc_ref.update({
-                        "status": "Unresolvable",
-                        "last_attempt_timestamp": firestore.SERVER_TIMESTAMP,
-                        "final_error_message": error_message
-                    })
-                    break
-                except Exception as e_update:
-                    active_logger.warning(f"Firestore update failed on attempt {attempt + 1}: {str(e_update)}")
-                    if attempt < MAX_FIRESTORE_RETRIES - 1:
-                        time.sleep(RETRY_BACKOFF * (2 ** attempt))
-                    else:
-                        active_logger.error(f"Max retries reached for Firestore update: {str(e_update)}")
-                        raise
-            return {"status": "failed", "message": f"Max retries reached for {identifier}"}
+            active_logger.error(f"Max retries ({MAX_RETRIES}) reached for identifier '{identifier}' at stage '{stage}'. Error: {current_error_message}")
+            error_doc_ref.update({
+                "status": "Unresolvable_Max_Retries",
+                "last_retry_attempt_timestamp": firestore.SERVER_TIMESTAMP,
+                "final_error_message": current_error_message
+            })
+            return {"status": "failed_max_retries", "message": f"Max retries reached for {identifier} at stage {stage}."}
 
-        target_collection_name = search_results_collection_name if dataset_type == "search_results" else firestore_collection_name
-        doc_ref = db.collection(target_collection_name).document(identifier)
-        doc = doc_ref.get()
-        doc_data = doc.to_dict() if doc.exists else {}
+        main_doc_ref = db.collection(firestore_collection_name).document(str(identifier))
+        main_doc = main_doc_ref.get()
+        main_doc_data = main_doc.to_dict() if main_doc.exists else {}
 
+        # LLM analysis now uses the potentially merged `project_config`
         llm_suggestion = analyze_error_with_vertex_ai(
-            error_message, stage, field_mappings, dataset_fields, gcp_project_id, active_logger,
-            extra_context={"doc_data": doc_data}
+            error_message=current_error_message,
+            stage=stage,
+            field_mappings=project_config.get("field_mappings", {}),
+            dataset_fields=list(original_item_snapshot.keys()),
+            gcp_project_id=gcp_project_id,
+            logger_instance=active_logger,
+            extra_context={"firestore_doc_data": main_doc_data, "project_config": project_config} # Pass merged config
         )
+
         adjusted_params = llm_suggestion.get("adjusted_params", {})
-        truncate_content_flag = adjusted_params.get("truncate_content", False)
-        recheck_metadata_flag = adjusted_params.get("recheck_metadata", False)
-        field_remapping_suggestion = adjusted_params.get("field_remapping", {})
-        active_logger.info(f"LLM suggested params: truncate_content={truncate_content_flag}, recheck_metadata={recheck_metadata_flag}, field_remapping={field_remapping_suggestion}")
+        attempt_re_scrape = adjusted_params.get("recheck_metadata", False) or adjusted_params.get("retry_fetch", False)
+        truncate_html_content = adjusted_params.get("truncate_content", False)
 
-        current_field_mappings = field_mappings.copy()
-        if isinstance(field_remapping_suggestion, dict):
-            for field, new_source in field_remapping_suggestion.items():
-                if isinstance(new_source, str):
-                    current_field_mappings[field] = {"source": new_source, "type": "direct"}
-                    active_logger.info(f"Updated field mapping for retry: {field} -> {new_source}")
-                else:
-                    active_logger.warning(f"Invalid new_source '{new_source}' for field '{field}'")
+        active_logger.info(
+            f"LLM suggestion for '{identifier}': Retry={llm_suggestion.get('retry', False)}, "
+            f"Reason='{llm_suggestion.get('reason', 'N/A')}', Category='{llm_suggestion.get('category', 'N/A')}', "
+            f"Adjusted Params: {adjusted_params}"
+        )
 
-        for attempt in range(MAX_FIRESTORE_RETRIES):
-            try:
-                error_doc_ref.update({
-                    "llm_suggestion_history": firestore.ArrayUnion([llm_suggestion]),
-                    "last_attempt_timestamp": firestore.SERVER_TIMESTAMP,
-                    "retry_attempt_details": firestore.ArrayUnion([{
-                        "timestamp": firestore.SERVER_TIMESTAMP,
-                        "retry_count": retry_count + 1,
-                        "stage": stage,
-                        "llm_suggestion": llm_suggestion,
-                        "applied_params": {
-                            "truncate_content": truncate_content_flag,
-                            "recheck_metadata": recheck_metadata_flag,
-                            "field_remapping": field_remapping_suggestion
-                        }
-                    }])
-                })
-                break
-            except Exception as e_update:
-                active_logger.warning(f"Firestore update failed on attempt {attempt + 1}: {str(e_update)}")
-                if attempt < MAX_FIRESTORE_RETRIES - 1:
-                    time.sleep(RETRY_BACKOFF * (2 ** attempt))
-                else:
-                    active_logger.error(f"Max retries reached for Firestore update: {str(e_update)}")
-                    raise
+        error_doc_ref.update({
+            "llm_suggestion_history": firestore.ArrayUnion([llm_suggestion]),
+            "last_retry_attempt_timestamp": firestore.SERVER_TIMESTAMP,
+            "retry_attempt_details": firestore.ArrayUnion([{
+                "timestamp": firestore.SERVER_TIMESTAMP,
+                "retry_count": retry_count + 1,
+                "stage": stage,
+                "llm_suggestion": llm_suggestion,
+                "applied_params": adjusted_params
+            }])
+        })
 
-        next_retry_count = retry_count + 1
+        if not llm_suggestion.get("retry", True):
+            active_logger.warning(f"LLM advised not to retry for identifier '{identifier}' at stage '{stage}'. Reason: {llm_suggestion.get('reason')}")
+            error_doc_ref.update({"status": f"Unresolvable_LLM_Advised_No_Retry"})
+            return {"status": "failed_llm_no_retry", "message": f"LLM advised not to retry for {identifier}."}
 
-        def publish_for_next_retry(current_error_msg="Retry attempt failed", item_snapshot=None):
-            for attempt in range(MAX_FIRESTORE_RETRIES):
-                try:
-                    error_doc_ref.update({
-                        "retry_count": next_retry_count,
-                        "error": f"Retry attempt {next_retry_count} for stage '{stage}' failed: {sanitize_error_message(current_error_msg)}",
-                        "status": "Retrying"
-                    })
-                    break
-                except Exception as e_update:
-                    active_logger.warning(f"Firestore update failed on attempt {attempt + 1}: {str(e_update)}")
-                    if attempt < MAX_FIRESTORE_RETRIES - 1:
-                        time.sleep(RETRY_BACKOFF * (2 ** attempt))
-                    else:
-                        active_logger.error(f"Max retries reached for Firestore update: {str(e_update)}")
-                        raise
-            retry_message_payload = {
+        next_retry_count_for_pubsub = retry_count + 1
+
+        def publish_for_next_retry_attempt(error_msg_for_doc="Retry attempt failed", item_snapshot_for_next=None, specific_doc_data_for_next=None):
+            error_doc_ref.update({
+                "retry_count": next_retry_count_for_pubsub,
+                "error": f"Retry attempt {retry_count + 1} for stage '{stage}' failed, queueing attempt {next_retry_count_for_pubsub}. Last error: {sanitize_error_message(error_msg_for_doc)}",
+                "status": "Retrying_Queued"
+            })
+            retry_message_payload_dict = {
                 "customer": customer_id,
                 "project": project_id_config_name,
-                "dataset_id": dataset_id,
-                "dataset_type": dataset_type,
+                "original_input_id": original_input_id,
                 "identifier": identifier,
+                "main_url": main_url_from_payload,
+                "category_url": category_url_from_payload,
                 "stage": stage,
-                "retry_count": next_retry_count,
-                "item_data_snapshot": item_snapshot or original_item,
-                "doc_data": doc_data
+                "retry_count": next_retry_count_for_pubsub,
+                "item_data_snapshot": item_snapshot_for_next or original_item_snapshot,
+                "error_message": error_msg_for_doc
             }
-            publisher.publish(retry_topic_path, json.dumps(retry_message_payload, default=str).encode('utf-8'))
-            active_logger.info(f"Published retry message for identifier '{identifier}', stage '{stage}', attempt {next_retry_count}")
+            if specific_doc_data_for_next:
+                 retry_message_payload_dict["doc_data_snapshot"] = specific_doc_data_for_next
 
-        if stage == "extract_metadata":
-            if not original_item:
-                active_logger.error(f"Cannot retry 'extract_metadata' for '{identifier}': missing original_item")
-                for attempt in range(MAX_FIRESTORE_RETRIES):
-                    try:
-                        error_doc_ref.update({"status": "Unresolvable", "error": "Missing original_item"})
-                        break
-                    except Exception as e_update:
-                        if attempt < MAX_FIRESTORE_RETRIES - 1:
-                            time.sleep(RETRY_BACKOFF * (2 ** attempt))
-                        else:
-                            raise
-                return {"status": "failed", "message": "Missing original_item"}
+            publisher.publish(retry_topic_path, json.dumps(retry_message_payload_dict, default=str).encode('utf-8'))
+            active_logger.info(f"Published to self for next retry attempt {next_retry_count_for_pubsub} for identifier '{identifier}', stage '{stage}'.")
 
-            try:
-                content_url, _ = find_url_in_item(original_item, active_logger)
-                if not content_url:
-                    active_logger.error(f"No valid URL for retry item {identifier}")
-                    publish_for_next_retry("No valid URL found", original_item)
-                    return {"status": "retry_queued", "identifier": identifier, "stage": stage, "message": "No valid URL found"}
+        retry_payload = {
+            "customer": customer_id,
+            "project": project_id_config_name,
+            "identifier": identifier,
+             # Add original_input_id to be passed along consistently if present
+            "original_input_id": original_input_id
+        }
+        target_topic_name = None
+        resolved_this_attempt = False
 
-                # Re-fetch from Apify if recheck_metadata is suggested
-                if recheck_metadata_flag and apify_contents_dataset_id:
-                    apify_key = get_secret(project_config.get("apify_api_key_secret", "apify-api-key"), gcp_project_id)
-                    apify_client = ApifyClient(apify_key)
-                    try:
-                        items = apify_client.dataset(apify_contents_dataset_id).list_items(
-                            offset=0, limit=APIFY_BATCH_SIZE, fields=["url", "htmlContent", "html", "content"]
-                        ).items
-                        for item in items:
-                            item_url, _ = find_url_in_item(item, active_logger)
-                            if item_url and generate_url_hash(item_url) == identifier:
-                                original_item.update(item)
-                                active_logger.info(f"Updated original_item for {identifier} from Apify dataset")
-                                break
-                    except Exception as e_apify:
-                        active_logger.warning(f"Failed to re-fetch from Apify for {identifier}: {str(e_apify)}")
+        if stage == "ingest-category-urls":
+            target_topic_name = INGEST_CATEGORY_URLS_TOPIC_NAME
+            retry_payload["csv_gcs_path"] = original_item_snapshot.get("csv_gcs_path") or original_input_id
+            if not retry_payload["csv_gcs_path"]:
+                 active_logger.error(f"Cannot retry '{stage}' for '{identifier}': missing CSV GCS path.")
+                 publish_for_next_retry_attempt("Missing CSV GCS path for ingest-category-urls retry", original_item_snapshot)
+                 return {"status": "retry_queued", "message": "Missing CSV GCS path"}
 
-                metadata = {
-                    "scrape_date": original_item.get("extractionTimestamp", datetime.now(timezone.utc)),
-                    "processed_at_extract_metadata_retry": firestore.SERVER_TIMESTAMP,
-                    "retry_attempt_count": next_retry_count,
-                    "main_url": content_url,
-                    "dataset_id_source": dataset_id
-                }
+        elif stage == "discover-main-urls":
+            target_topic_name = DISCOVER_MAIN_URLS_TOPIC_NAME
+            retry_payload["category_url"] = category_url_from_payload or original_item_snapshot.get("category_url")
+            if not retry_payload["category_url"]:
+                active_logger.error(f"Cannot retry '{stage}' for '{identifier}': missing category_url.")
+                publish_for_next_retry_attempt("Missing category_url for discover-main-urls retry", original_item_snapshot)
+                return {"status": "retry_queued", "message": "Missing category_url"}
 
-                fields_to_process = search_required_fields if dataset_type == "search_results" else required_fields
-                sequence_doc_ref = db.collection(f"{firestore_collection_name}_metadata").document("sequence")
-                transaction = db.transaction()
-                sequence_doc = sequence_doc_ref.get()
-                sequence_number = sequence_doc.to_dict().get("last_sequence", 0) + 1 if sequence_doc.exists else 1
+        elif stage == "extract-initial-metadata":
+            target_topic_name = EXTRACT_INITIAL_METADATA_TOPIC_NAME
+            retry_payload["main_url"] = main_url_from_payload or original_item_snapshot.get("main_url")
+            retry_payload["category_url"] = category_url_from_payload or original_item_snapshot.get("category_url")
+            if not retry_payload["main_url"]:
+                active_logger.error(f"Cannot retry '{stage}' for '{identifier}': missing main_url.")
+                publish_for_next_retry_attempt("Missing main_url for extract-initial-metadata retry", original_item_snapshot)
+                return {"status": "retry_queued", "message": "Missing main_url"}
+            retry_payload["category_page_metadata"] = original_item_snapshot.get("category_page_metadata", {})
 
-                for field_name in fields_to_process:
-                    value = get_mapped_field(
-                        original_item, field_name, current_field_mappings, logger_instance=active_logger,
-                        extra_context={"sequence_number": sequence_number, "project": project_id_config_name}
-                    )
-                    if value is not None and value != "Not Available":
-                        metadata[field_name] = value
-                        active_logger.debug(f"Mapped field '{field_name}' to value: {value}")
-                    else:
-                        active_logger.warning(f"Field '{field_name}' not mapped for {identifier}")
-                    if field_name == "Law-ID" and metadata.get("Law-ID") != "Not Available":
-                        sequence_number += 1
+        elif stage == "fetch-content":
+            target_topic_name = FETCH_CONTENT_TOPIC_NAME
+            retry_payload["main_url"] = main_url_from_payload or main_doc_data.get("main_url")
+            if not retry_payload["main_url"]:
+                active_logger.error(f"Cannot retry '{stage}' for '{identifier}': missing main_url in item snapshot or Firestore doc.")
+                publish_for_next_retry_attempt("Missing main_url for fetch-content retry", original_item_snapshot, main_doc_data)
+                return {"status": "retry_queued", "message": "Missing main_url"}
 
-                if metadata.get("Law-ID") == "Not Available":
-                    active_logger.error(f"Invalid Law-ID for retry item {identifier}")
-                    publish_for_next_retry("Invalid Law-ID generated", original_item)
-                    return {"status": "retry_queued", "identifier": identifier, "stage": stage, "message": "Invalid Law-ID generated"}
+        elif stage == "generate-xml":
+            target_topic_name = GENERATE_XML_TOPIC_NAME
+            retry_payload["main_url"] = main_doc_data.get("main_url") # For logging/context in target function
+            if not main_doc.exists or not main_doc_data.get("html_gcs_path"):
+                active_logger.error(f"Cannot retry '{stage}' for '{identifier}': Firestore doc or html_gcs_path missing.")
+                publish_for_next_retry_attempt("Missing Firestore data or GCS HTML path for generate-xml retry", original_item_snapshot, main_doc_data)
+                return {"status": "retry_queued", "message": "Missing Firestore data or GCS HTML path"}
+            # `identifier` is already in retry_payload and is the main lookup key for generate_xml
 
-                # Store HTML in GCS if available
-                html_content = original_item.get("htmlContent") or original_item.get("html") or original_item.get("content")
-                html_path_gcs = None
-                if html_content:
-                    html_content = validate_html_content(html_content, active_logger)
-                    if html_content:
-                        if truncate_content_flag and len(html_content.encode('utf-8')) > MAX_DOCUMENT_SIZE:
-                            html_content = html_content[:MAX_DOCUMENT_SIZE // 2]
-                            active_logger.info(f"Truncated HTML content for {identifier} to {len(html_content.encode('utf-8'))} bytes")
-                        safe_project_id_path = "".join(c if c.isalnum() else '_' for c in project_id_config_name)
-                        date_str = datetime.now().strftime('%Y%m%d')
-                        gcs_temp_html_path = f"temp_html/{safe_project_id_path}/{date_str}"
-                        destination_blob_name = f"{gcs_temp_html_path}/{identifier}_temp.html"
-                        blob = bucket.blob(destination_blob_name)
-                        for attempt in range(MAX_FIRESTORE_RETRIES):
-                            try:
-                                blob.upload_from_string(html_content, content_type="text/html; charset=utf-8")
-                                html_path_gcs = f"gs://{gcs_bucket_name}/{destination_blob_name}"
-                                metadata["html_path"] = html_path_gcs
-                                active_logger.info(f"Stored uncompressed HTML for {identifier} to GCS: {html_path_gcs}")
-                                break
-                            except Exception as e_upload:
-                                active_logger.warning(f"GCS upload failed on attempt {attempt + 1}: {str(e_upload)}")
-                                if attempt < MAX_FIRESTORE_RETRIES - 1:
-                                    time.sleep(RETRY_BACKOFF * (2 ** attempt))
-                                else:
-                                    active_logger.error(f"Max retries reached for GCS upload: {str(e_upload)}")
-                                    publish_for_next_retry(f"GCS upload failed: {str(e_upload)}", original_item)
-                                    return {"status": "retry_queued", "identifier": identifier, "stage": stage, "message": f"GCS upload failed: {str(e_upload)}"}
-
-                serialized_metadata_str = json.dumps(metadata, default=str)
-                serialized_size = len(serialized_metadata_str.encode('utf-8'))
-                if serialized_size > MAX_DOCUMENT_SIZE:
-                    active_logger.warning(f"Document {identifier} exceeds Firestore size limit ({serialized_size} bytes)")
-                    gcs_path = f"oversized_metadata/{project_id_config_name}/{dataset_id}/{identifier}.json"
-                    blob = bucket.blob(gcs_path)
-                    for attempt in range(MAX_FIRESTORE_RETRIES):
-                        try:
-                            blob.upload_from_string(serialized_metadata_str, content_type="application/json")
-                            break
-                        except Exception as e_upload:
-                            if attempt < MAX_FIRESTORE_RETRIES - 1:
-                                time.sleep(RETRY_BACKOFF * (2 ** attempt))
-                            else:
-                                raise
-                    minimal_metadata = {
-                        "Law-ID": metadata.get("Law-ID", "Not Available"),
-                        "main_url": metadata.get("main_url", "Not Available"),
-                        "scrape_date": metadata.get("scrape_date"),
-                        "processed_at_extract_metadata_retry": firestore.SERVER_TIMESTAMP,
-                        "dataset_id_source": dataset_id,
-                        "full_metadata_gcs_path": f"gs://{gcs_bucket_name}/{gcs_path}",
-                        "status_notice": "Full metadata stored in GCS due to size"
-                    }
-                    for attempt in range(MAX_FIRESTORE_RETRIES):
-                        try:
-                            db.collection(target_collection_name).document(identifier).set(minimal_metadata, merge=True)
-                            break
-                        except Exception as e_update:
-                            if attempt < MAX_FIRESTORE_RETRIES - 1:
-                                time.sleep(RETRY_BACKOFF * (2 ** attempt))
-                            else:
-                                raise
-                else:
-                    for attempt in range(MAX_FIRESTORE_RETRIES):
-                        try:
-                            db.collection(target_collection_name).document(identifier).set(metadata, merge=True)
-                            break
-                        except Exception as e_update:
-                            active_logger.warning(f"Firestore update failed on attempt {attempt + 1}: {str(e_update)}")
-                            if attempt < MAX_FIRESTORE_RETRIES - 1:
-                                time.sleep(RETRY_BACKOFF * (2 ** attempt))
-                            else:
-                                active_logger.error(f"Max retries reached for Firestore update: {str(e_update)}")
-                                publish_for_next_retry(f"Firestore update failed: {str(e_update)}", original_item)
-                                return {"status": "retry_queued", "identifier": identifier, "stage": stage, "message": f"Firestore update failed: {str(e_update)}"}
-
-                if sequence_number > 1:
-                    update_sequence(transaction, sequence_doc_ref, sequence_number)
-
-                publisher.publish(
-                    publisher.topic_path(gcp_project_id, "fix-image-urls"),
-                    json.dumps({
-                        "customer": customer_id,
-                        "project": project_id_config_name,
-                        "dataset_id": dataset_id,
-                        "dataset_type": dataset_type,
-                        "identifier": identifier,
-                        "main_url": content_url,
-                        "html_path": html_path_gcs,
-                        "date": datetime.now().strftime('%Y%m%d'),
-                        "apify_dataset_id_source": dataset_id
-                    }).encode('utf-8')
-                )
-
-                for attempt in range(MAX_FIRESTORE_RETRIES):
-                    try:
-                        error_doc_ref.update({
-                            "status": "Resolved",
-                            "resolved_at_timestamp": firestore.SERVER_TIMESTAMP,
-                            "resolution_details": "Successfully processed at extract_metadata stage during retry"
-                        })
-                        break
-                    except Exception as e_update:
-                        active_logger.warning(f"Firestore update failed on attempt {attempt + 1}: {str(e_update)}")
-                        if attempt < MAX_FIRESTORE_RETRIES - 1:
-                            time.sleep(RETRY_BACKOFF * (2 ** attempt))
-                        else:
-                            active_logger.error(f"Max retries reached for Firestore update: {str(e_update)}")
-                            raise
-                return {"status": "success", "identifier": identifier, "stage": stage, "message": "extract_metadata retried successfully"}
-
-            except Exception as e:
-                active_logger.error(f"Retry attempt {next_retry_count} failed for '{identifier}' at 'extract_metadata': {str(e)}", exc_info=True)
-                publish_for_next_retry(str(e), original_item)
-                return {"status": "retry_queued", "identifier": identifier, "stage": stage, "message": f"extract_metadata retry failed: {str(e)}"}
-
-        elif stage == "fix_image_urls":
-            try:
-                if not doc.exists:
-                    active_logger.error(f"No Firestore document for identifier {identifier}")
-                    publish_for_next_retry("No Firestore document found")
-                    return {"status": "retry_queued", "identifier": identifier, "stage": stage, "message": "No Firestore document found"}
-
-                doc_data = doc.to_dict()
-                main_url = doc_data.get("main_url", original_item.get("main_url", original_item.get("mainUrl")))
-                html_path = doc_data.get("html_path")
-                if not main_url or not html_path:
-                    active_logger.error(f"Missing main_url or html_path for identifier {identifier}")
-                    publish_for_next_retry("Missing main_url or html_path")
-                    return {"status": "retry_queued", "identifier": identifier, "stage": stage, "message": "Missing main_url or html_path"}
-
-                # Verify HTML exists in GCS
-                blob = bucket.blob(html_path.replace(f"gs://{gcs_bucket_name}/", ""))
-                if not blob.exists():
-                    active_logger.error(f"HTML file {html_path} not found in GCS for {identifier}")
-                    publish_for_next_retry("HTML file not found in GCS")
-                    return {"status": "retry_queued", "identifier": identifier, "stage": stage, "message": "HTML file not found in GCS"}
-
-                publisher.publish(
-                    publisher.topic_path(gcp_project_id, "fix-image-urls"),
-                    json.dumps({
-                        "customer": customer_id,
-                        "project": project_id_config_name,
-                        "dataset_id": dataset_id,
-                        "dataset_type": dataset_type,
-                        "identifier": identifier,
-                        "main_url": main_url,
-                        "html_path": html_path,
-                        "date": datetime.now().strftime('%Y%m%d'),
-                        "apify_dataset_id_source": dataset_id,
-                        "apify_run_id_trigger": original_item.get("apify_run_id_trigger", "unknown")
-                    }).encode('utf-8')
-                )
-
-                for attempt in range(MAX_FIRESTORE_RETRIES):
-                    try:
-                        error_doc_ref.update({
-                            "status": "Resolved",
-                            "resolved_at_timestamp": firestore.SERVER_TIMESTAMP,
-                            "resolution_details": "Successfully triggered fix_image_urls retry"
-                        })
-                        break
-                    except Exception as e_update:
-                        active_logger.warning(f"Firestore update failed on attempt {attempt + 1}: {str(e_update)}")
-                        if attempt < MAX_FIRESTORE_RETRIES - 1:
-                            time.sleep(RETRY_BACKOFF * (2 ** attempt))
-                        else:
-                            active_logger.error(f"Max retries reached for Firestore update: {str(e_update)}")
-                            raise
-                return {"status": "success", "identifier": identifier, "stage": stage, "message": "fix_image_urls retried successfully"}
-
-            except Exception as e:
-                active_logger.error(f"Retry attempt {next_retry_count} failed for '{identifier}' at 'fix_image_urls': {str(e)}", exc_info=True)
-                publish_for_next_retry(str(e))
-                return {"status": "retry_queued", "identifier": identifier, "stage": stage, "message": f"fix_image_urls retry failed: {str(e)}"}
-
-        elif stage == "store_html":
-            try:
-                if not doc.exists:
-                    active_logger.error(f"No Firestore document for identifier {identifier}")
-                    publish_for_next_retry("No Firestore document found")
-                    return {"status": "retry_queued", "identifier": identifier, "stage": stage, "message": "No Firestore document found"}
-
-                doc_data = doc.to_dict()
-                main_url = doc_data.get("main_url", original_item.get("main_url", original_item.get("mainUrl")))
-                html_path = doc_data.get("html_path")
-                if not main_url or not html_path:
-                    active_logger.error(f"Missing main_url or html_path for identifier {identifier}")
-                    publish_for_next_retry("Missing main_url or html_path")
-                    return {"status": "retry_queued", "identifier": identifier, "stage": stage, "message": "Missing main_url or html_path"}
-
-                # Fetch HTML from GCS
-                fixed_html_content = None
-                try:
-                    blob = bucket.blob(html_path.replace(f"gs://{gcs_bucket_name}/", ""))
-                    if blob.exists():
-                        fixed_html_content = blob.download_as_text()
-                        fixed_html_content = validate_html_content(fixed_html_content, active_logger)
-                        if not fixed_html_content:
-                            active_logger.error(f"Invalid HTML content from GCS for {identifier}")
-                            publish_for_next_retry("Invalid HTML content from GCS")
-                            return {"status": "retry_queued", "identifier": identifier, "stage": stage, "message": "Invalid HTML content from GCS"}
-                    else:
-                        active_logger.error(f"HTML file {html_path} not found in GCS for {identifier}")
-                        publish_for_next_retry("HTML file not found in GCS")
-                        return {"status": "retry_queued", "identifier": identifier, "stage": stage, "message": "HTML file not found in GCS"}
-                except Exception as e_gcs:
-                    active_logger.error(f"Failed to fetch HTML from GCS for {identifier}: {str(e_gcs)}", exc_info=True)
-                    publish_for_next_retry(f"GCS fetch failed: {str(e_gcs)}")
-                    return {"status": "retry_queued", "identifier": identifier, "stage": stage, "message": f"GCS fetch failed: {str(e_gcs)}"}
-
-                # Re-fetch augmentation data if recheck_metadata is suggested
-                if recheck_metadata_flag and apify_search_results_dataset_id:
-                    apify_key = get_secret(project_config.get("apify_api_key_secret", "apify-api-key"), gcp_project_id)
-                    apify_client = ApifyClient(apify_key)
-                    try:
-                        items = apify_client.dataset(apify_search_results_dataset_id).list_items(
-                            offset=0, limit=APIFY_BATCH_SIZE, fields=["url", "pdfLink", "pdf_link"]
-                        ).items
-                        for item in items:
-                            item_url, _ = find_url_in_item(item, active_logger)
-                            if item_url and generate_url_hash(item_url) == identifier:
-                                original_item.update(item)
-                                active_logger.info(f"Updated original_item for {identifier} from Apify search dataset")
-                                break
-                    except Exception as e_apify:
-                        active_logger.warning(f"Failed to re-fetch from Apify for {identifier}: {str(e_apify)}")
-
-                publisher.publish(
-                    publisher.topic_path(gcp_project_id, "store-html"),
-                    json.dumps({
-                        "customer": customer_id,
-                        "project": project_id_config_name,
-                        "dataset_id": dataset_id,
-                        "dataset_type": dataset_type,
-                        "identifier": identifier,
-                        "main_url": main_url,
-                        "fixed_html_content": fixed_html_content[:500000] if truncate_content_flag else fixed_html_content,
-                        "images_fixed_count": doc_data.get("images_fixed_count", 0),
-                        "date": datetime.now().strftime('%Y%m%d'),
-                        "apify_dataset_id_source": dataset_id,
-                        "apify_run_id_trigger": original_item.get("apify_run_id_trigger", "unknown")
-                    }).encode('utf-8')
-                )
-
-                for attempt in range(MAX_FIRESTORE_RETRIES):
-                    try:
-                        error_doc_ref.update({
-                            "status": "Resolved",
-                            "resolved_at_timestamp": firestore.SERVER_TIMESTAMP,
-                            "resolution_details": "Successfully triggered store_html retry"
-                        })
-                        break
-                    except Exception as e_update:
-                        active_logger.warning(f"Firestore update failed on attempt {attempt + 1}: {str(e_update)}")
-                        if attempt < MAX_FIRESTORE_RETRIES - 1:
-                            time.sleep(RETRY_BACKOFF * (2 ** attempt))
-                        else:
-                            active_logger.error(f"Max retries reached for Firestore update: {str(e_update)}")
-                            raise
-                return {"status": "success", "identifier": identifier, "stage": stage, "message": "store_html retried successfully"}
-
-            except Exception as e:
-                active_logger.error(f"Retry attempt {next_retry_count} failed for '{identifier}' at 'store_html': {str(e)}", exc_info=True)
-                publish_for_next_retry(str(e))
-                return {"status": "retry_queued", "identifier": identifier, "stage": stage, "message": f"store_html retry failed: {str(e)}"}
-
-        elif stage == "generate_xml":
-            try:
-                if not doc.exists:
-                    active_logger.error(f"No Firestore document for identifier {identifier}")
-                    publish_for_next_retry("No Firestore document found")
-                    return {"status": "retry_queued", "identifier": identifier, "stage": stage, "message": "No Firestore document found"}
-
-                doc_data = doc.to_dict()
-                main_url = doc_data.get("main_url", original_item.get("main_url", original_item.get("mainUrl")))
-                html_path = doc_data.get("html_path")
-                if not main_url or not html_path:
-                    active_logger.error(f"Missing main_url or html_path for identifier {identifier}")
-                    publish_for_next_retry("Missing main_url or html_path")
-                    return {"status": "retry_queued", "identifier": identifier, "stage": stage, "message": "Missing main_url or html_path"}
-
-                # Verify HTML exists in GCS
-                blob = bucket.blob(html_path.replace(f"gs://{gcs_bucket_name}/", ""))
-                if not blob.exists():
-                    active_logger.error(f"HTML file {html_path} not found in GCS for {identifier}")
-                    publish_for_next_retry("HTML file not found in GCS")
-                    return {"status": "retry_queued", "identifier": identifier, "stage": stage, "message": "HTML file not found in GCS"}
-
-                publisher.publish(
-                    publisher.topic_path(gcp_project_id, "generate-xml"),
-                    json.dumps({
-                        "customer": customer_id,
-                        "project": project_id_config_name,
-                        "dataset_id": dataset_id,
-                        "dataset_type": dataset_type,
-                        "identifier": identifier,
-                        "main_url": main_url,
-                        "html_path": html_path,
-                        "date": datetime.now().strftime('%Y%m%d'),
-                        "apify_dataset_id_source": dataset_id,
-                        "apify_run_id_trigger": original_item.get("apify_run_id_trigger", "unknown")
-                    }).encode('utf-8')
-                )
-
-                for attempt in range(MAX_FIRESTORE_RETRIES):
-                    try:
-                        error_doc_ref.update({
-                            "status": "Resolved",
-                            "resolved_at_timestamp": firestore.SERVER_TIMESTAMP,
-                            "resolution_details": "Successfully triggered generate_xml retry"
-                        })
-                        break
-                    except Exception as e_update:
-                        active_logger.warning(f"Firestore update failed on attempt {attempt + 1}: {str(e_update)}")
-                        if attempt < MAX_FIRESTORE_RETRIES - 1:
-                            time.sleep(RETRY_BACKOFF * (2 ** attempt))
-                        else:
-                            active_logger.error(f"Max retries reached for Firestore update: {str(e_update)}")
-                            raise
-                return {"status": "success", "identifier": identifier, "stage": stage, "message": "generate_xml retried successfully"}
-
-            except Exception as e:
-                active_logger.error(f"Retry attempt {next_retry_count} failed for '{identifier}' at 'generate_xml': {str(e)}", exc_info=True)
-                publish_for_next_retry(str(e))
-                return {"status": "retry_queued", "identifier": identifier, "stage": stage, "message": f"generate_xml retry failed: {str(e)}"}
-
-        elif stage == "generate_reports":
-            try:
-                date_str = data.get("date", datetime.now().strftime('%Y%m%d'))
-                publisher.publish(
-                    publisher.topic_path(gcp_project_id, "generate-reports"),
-                    json.dumps({
-                        "customer": customer_id,
-                        "project": project_id_config_name,
-                        "dataset_id": dataset_id,
-                        "dataset_type": dataset_type,
-                        "identifier": identifier,
-                        "date": date_str
-                    }).encode('utf-8')
-                )
-
-                for attempt in range(MAX_FIRESTORE_RETRIES):
-                    try:
-                        error_doc_ref.update({
-                            "status": "Resolved",
-                            "resolved_at_timestamp": firestore.SERVER_TIMESTAMP,
-                            "resolution_details": "Successfully triggered generate_reports retry"
-                        })
-                        break
-                    except Exception as e_update:
-                        active_logger.warning(f"Firestore update failed on attempt {attempt + 1}: {str(e_update)}")
-                        if attempt < MAX_FIRESTORE_RETRIES - 1:
-                            time.sleep(RETRY_BACKOFF * (2 ** attempt))
-                        else:
-                            active_logger.error(f"Max retries reached for Firestore update: {str(e_update)}")
-                            raise
-                return {"status": "success", "identifier": identifier, "stage": stage, "message": "generate_reports retried successfully"}
-
-            except Exception as e:
-                active_logger.error(f"Retry attempt {next_retry_count} failed for '{identifier}' at 'generate_reports': {str(e)}", exc_info=True)
-                publish_for_next_retry(str(e))
-                return {"status": "retry_queued", "identifier": identifier, "stage": stage, "message": f"generate_reports retry failed: {str(e)}"}
+        elif stage == "generate-reports":
+            target_topic_name = GENERATE_REPORTS_TOPIC_NAME
+            retry_payload["report_date"] = original_item_snapshot.get("report_date", datetime.now(timezone.utc).strftime('%Y%m%d')) # Use "report_date" consistently
+            retry_payload["processing_batch_id"] = original_item_snapshot.get("processing_batch_id", original_input_id)
+            # 'identifier' here might be a report config name or a batch ID; ensure target function handles it.
+            # For consistency, the 'identifier' from pubsub message is already in retry_payload.
+            # If generate-reports uses a different kind of identifier, that should be in original_item_snapshot.
 
         else:
-            active_logger.error(f"Unsupported retry stage '{stage}' for identifier '{identifier}'")
-            for attempt in range(MAX_FIRESTORE_RETRIES):
-                try:
-                    error_doc_ref.update({"status": "Unresolvable", "error": f"Unsupported retry stage: {stage}"})
-                    break
-                except Exception as e_update:
-                    active_logger.warning(f"Firestore update failed on attempt {attempt + 1}: {str(e_update)}")
-                    if attempt < MAX_FIRESTORE_RETRIES - 1:
-                        time.sleep(RETRY_BACKOFF * (2 ** attempt))
-                    else:
-                        active_logger.error(f"Max retries reached for Firestore update: {str(e_update)}")
-                        raise
-            return {"status": "failed", "message": f"Unsupported retry stage: {stage}"}
+            active_logger.error(f"Unsupported retry stage '{stage}' for identifier '{identifier}'. Error: {current_error_message}")
+            error_doc_ref.update({"status": f"Unresolvable_Unsupported_Stage"})
+            return {"status": "failed_unsupported_stage", "message": f"Unsupported retry stage: {stage}"}
 
-    except Exception as e:
-        active_logger.error(f"Critical error in retry_pipeline: {str(e)}", exc_info=True)
-        if 'error_doc_ref' in locals():
-            for attempt in range(MAX_FIRESTORE_RETRIES):
-                try:
-                    error_doc_ref.update({
-                        "error": f"Critical error: {sanitize_error_message(str(e))}",
-                        "status": "Failed",
-                        "last_attempt_timestamp": firestore.SERVER_TIMESTAMP
-                    })
-                    break
-                except Exception as e_update:
-                    active_logger.warning(f"Firestore update failed on attempt {attempt + 1}: {str(e_update)}")
-                    if attempt < MAX_FIRESTORE_RETRIES - 1:
-                        time.sleep(RETRY_BACKOFF * (2 ** attempt))
-                    else:
-                        active_logger.error(f"Max retries reached for Firestore update: {str(e_update)}")
-                        raise
+        if target_topic_name:
+            try:
+                # Ensure identifier is part of the payload if not already explicitly added for this stage
+                if "identifier" not in retry_payload:
+                    retry_payload["identifier"] = identifier
+
+                publisher.publish(
+                    publisher.topic_path(gcp_project_id, target_topic_name),
+                    json.dumps(retry_payload, default=str).encode('utf-8')
+                )
+                active_logger.info(f"Successfully re-triggered stage '{stage}' for identifier '{identifier}' to topic '{target_topic_name}' with payload: {json.dumps(retry_payload, default=str)}")
+                resolved_this_attempt = True
+            except Exception as e_publish:
+                active_logger.error(f"Failed to publish re-trigger message for '{identifier}' to '{target_topic_name}': {e_publish}", exc_info=True)
+                publish_for_next_retry_attempt(f"Failed to publish to target topic {target_topic_name}: {e_publish}", original_item_snapshot, main_doc_data)
+                return {"status": "retry_queued", "message": f"Failed to publish to target topic {target_topic_name}"}
+
+        if resolved_this_attempt:
+            error_doc_ref.update({
+                "status": "Resolved_Retriggered",
+                "resolved_at_timestamp": firestore.SERVER_TIMESTAMP,
+                "resolution_details": f"Successfully re-triggered stage '{stage}' via retry_pipeline after {retry_count + 1} attempts."
+            })
+            active_logger.info(f"Marked error for '{identifier}' as Resolved_Retriggered for stage '{stage}'.")
+            return {"status": "success_retriggered", "identifier": identifier, "stage": stage}
+        else:
+            active_logger.error(f"Retry logic for stage '{stage}' did not result in a re-trigger or explicit failure for '{identifier}'.")
+            publish_for_next_retry_attempt(f"Internal retry logic incomplete for stage {stage}", original_item_snapshot, main_doc_data)
+            return {"status": "retry_queued", "message": f"Internal retry logic incomplete for stage {stage}"}
+
+    except Exception as e_critical:
+        critical_error_message = sanitize_error_message(str(e_critical))
+        # Use logger if active_logger is not defined due to early failure
+        effective_logger = active_logger if 'active_logger' in locals() and active_logger.handlers else logger
+        effective_logger.error(f"Critical error in retry_pipeline: {critical_error_message}", exc_info=True)
+        
+        current_identifier = data.get("identifier", "unknown_identifier") if 'data' in locals() else "unknown_identifier_at_critical"
+        if 'error_doc_ref' in locals() and error_doc_ref: # Check if error_doc_ref was initialized
+            try:
+                error_doc_ref.update({
+                    "error": f"Critical error in retry_pipeline itself for identifier {current_identifier}: {critical_error_message}",
+                    "status": "Failed_Critical_In_Retry",
+                    "last_retry_attempt_timestamp": firestore.SERVER_TIMESTAMP
+                })
+            except Exception as e_update_err_doc:
+                effective_logger.error(f"Failed to update error document for {current_identifier} during critical error handling: {e_update_err_doc}")
+        
         raise
