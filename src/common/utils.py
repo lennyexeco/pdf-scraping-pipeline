@@ -41,7 +41,8 @@ def setup_logging(customer_id, project_id):
     # Configure Python logging to use Cloud Logging
     handler = gcp_logging.handlers.CloudLoggingHandler(client)
     logging.getLogger().addHandler(handler)
-    logging.getLogger().setLevel(logging.INFO)
+    logging.getLogger().setLevel(logging.DEBUG)
+
     
     # Return a standard Python logger with context
     logger = logging.getLogger(f"{customer_id}_{project_id}")

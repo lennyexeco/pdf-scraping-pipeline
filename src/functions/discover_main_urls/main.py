@@ -114,7 +114,7 @@ def analyze_category_page_with_ai(html_content, project_config, gcp_project_id, 
     """
     active_logger = logger_instance if logger_instance else logger
     ai_model_cfg = project_config.get("ai_model_config", {})
-    model_id = ai_model_cfg.get("discovery_model_id", "gemini-1.0-pro") # Updated model if desired
+    model_id = ai_model_cfg.get("discovery_model_id", "gemini-2.0-flash-lite-001") # Updated model if desired
     vertex_ai_location = project_config.get("vertex_ai_location", "us-central1")
 
     if not html_content:
