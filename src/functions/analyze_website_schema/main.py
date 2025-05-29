@@ -38,8 +38,8 @@ def fetch_page_content(url, timeout=REQUEST_TIMEOUT, logger_instance=None):
     """Fetches HTML content from a URL using web-renderer service for dynamic content."""
     active_logger = logger_instance or logger
     # Get web-renderer URL from environment or project config
-    project_config = load_project_config(os.environ.get("PROJECT_CONFIG_NAME", "germany_federal_law"))
-    renderer_url = project_config.get("web_renderer_url", "https://web-renderer-<your-project-id>.run.app/render")  # Replace with actual URL
+    project_config = load_project_config(project_id)
+    renderer_url = project_config.get('web_renderer_url', None)
 
     try:
         # Prepare payload for web-renderer
