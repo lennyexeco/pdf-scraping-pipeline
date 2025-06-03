@@ -272,7 +272,7 @@ if ! gcloud config set project "$PROJECT_ID" >> "$LOG_FILE" 2>&1; then
 fi
 
 # Check quota project
-check_quota_project
+# check_quota_project
 
 # Create Artifact Registry repository if it doesn't exist
 echo "Checking for Artifact Registry repository..." | tee -a "$LOG_FILE"
@@ -287,7 +287,7 @@ if ! gcloud artifacts repositories describe web-renderer-repo \
 fi
 
 # Deploy web-renderer Cloud Run service
-deploy_web_renderer
+# deploy_web_renderer
 
 # Deploy Cloud Functions
 echo "Checking for Pub/Sub topics..." | tee -a "$LOG_FILE"
@@ -311,14 +311,14 @@ for topic in "${topics_to_ensure[@]}"; do
 done
 
 # Deploy Cloud Functions with corrected entry points
-deploy_single_function "ingest-category-urls" "ingest_category_urls_pubsub" "topic" "start-ingest-category-urls-topic" "functions/ingest_category_urls" "256MB" "300"
-deploy_single_function "ingest-category-urls-asic" "ingest_category_urls_pubsub" "topic" "start-asic-ingest-category-urls-topic" "functions/ingest_category_urls" "256MB" "300"
-deploy_single_function "analyze-website-schema" "analyze_website_schema" "topic" "start-analyze-website-schema-topic" "functions/analyze_website_schema" "1GB" "540"
-deploy_single_function "discover-main-urls" "discover_main_urls" "topic" "discover-main-urls-topic" "functions/discover_main_urls" "1GB" "540"
-deploy_single_function "extract-initial-metadata" "extract_initial_metadata" "topic" "extract-initial-metadata-topic" "functions/extract_initial_metadata" "1GB" "540"
+# deploy_single_function "ingest-category-urls" "ingest_category_urls_pubsub" "topic" "start-ingest-category-urls-topic" "functions/ingest_category_urls" "256MB" "300"
+# deploy_single_function "ingest-category-urls-asic" "ingest_category_urls_pubsub" "topic" "start-asic-ingest-category-urls-topic" "functions/ingest_category_urls" "256MB" "300"
+# deploy_single_function "analyze-website-schema" "analyze_website_schema" "topic" "start-analyze-website-schema-topic" "functions/analyze_website_schema" "1GB" "540"
+# deploy_single_function "discover-main-urls" "discover_main_urls" "topic" "discover-main-urls-topic" "functions/discover_main_urls" "1GB" "540"
+# deploy_single_function "extract-initial-metadata" "extract_initial_metadata" "topic" "extract-initial-metadata-topic" "functions/extract_initial_metadata" "1GB" "540"
 deploy_single_function "fetch-content" "fetch_content" "topic" "fetch-content-topic" "functions/fetch_content" "512MB" "540"
-deploy_single_function "generate-xml" "generate_xml" "topic" "generate-xml-topic" "functions/generate_xml" "512MB" "540"
-deploy_single_function "generate-reports" "generate_reports" "topic" "generate-reports-topic" "functions/generate_reports" "512MB" "540"
-deploy_single_function "retry-pipeline" "retry_pipeline" "topic" "retry-pipeline" "functions/retry_pipeline" "1GB" "300"
+# deploy_single_function "generate-xml" "generate_xml" "topic" "generate-xml-topic" "functions/generate_xml" "512MB" "540"
+# deploy_single_function "generate-reports" "generate_reports" "topic" "generate-reports-topic" "functions/generate_reports" "512MB" "540"
+# deploy_single_function "retry-pipeline" "retry_pipeline" "topic" "retry-pipeline" "functions/retry_pipeline" "1GB" "300"
 
 echo "All deployments completed!" | tee -a "$LOG_FILE"

@@ -1,0 +1,25 @@
+{
+  "customer_id": "your_customer_id",
+  "project_id": "fedao_frbny",
+  "project_abbreviation": "FEDAO",
+  "description": "Federal Reserve Bank of New York - Fed Announced Operations data processing.",
+  "source_urls": {
+    "treasury_operations": "https://www.newyorkfed.org/markets/domestic-market-operations/monetary-policy-implementation/treasury-securities/treasury-securities-operational-details",
+    "ambs_operations": "https://www.newyorkfed.org/markets/ambs_operation_schedule#tabs-2"
+  },
+  "output_csv_names": {
+    "moa": "FEDAO_MOA_DATA.csv",
+    "toa": "FEDAO_TOA_DATA.csv"
+  },
+  "gcs_bucket": "your-gcs-bucket-name",
+  "gcs_base_path_csv": "fedao_frbny/processed_csv",
+  "incremental_update": true,
+  "date_format_output": "%Y%m%d",
+  "pdf_parsing_config": {
+    "moa_table_area": ["120,30,700,970"],
+    "toa_table_area": ["150,30,750,970"]
+  },
+  "sftp_config_secret_ref": "projects/your-gcp-project-id/secrets/FEDAO_SFTP_CREDENTIALS/versions/latest",
+  "sftp_dev_path": "dfac-datadev-africaai-tm/Tabular_Manual/FRBNY/FEDAO",
+  "sftp_prod_path": "dfac-datadev-africaai-tm/Tabular_Manual/FRBNY/FEDAO"
+}
