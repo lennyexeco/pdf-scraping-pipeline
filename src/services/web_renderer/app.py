@@ -4,416 +4,280 @@ import logging
 import pyppeteer
 import os
 import json
+import atexit
 from datetime import datetime
 
-app = Flask(__name__)
-logging.basicConfig(level=logging.INFO)
+# --- Logging Setup ---
+# Configure logging to be more informative
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(module)s.%(funcName)s:%(lineno)d - %(message)s'
+)
 logger = logging.getLogger(__name__)
+
+
+app = Flask(__name__)
 
 class AdvancedRenderer:
     def __init__(self):
         self.browser = None
-        
+        self.lock = asyncio.Lock() # Ensure browser is initialized only once safely
+
     async def init_browser(self):
-        """Initialize browser with optimal settings"""
-        if not self.browser:
-            self.browser = await pyppeteer.launch(
-                headless=True,
-                args=[
-                    '--no-sandbox',
-                    '--disable-setuid-sandbox',
-                    '--disable-dev-shm-usage',
-                    '--disable-accelerated-2d-canvas',
-                    '--disable-gpu',
-                    '--window-size=1920x1080',
-                    '--disable-extensions',
-                    '--disable-plugins',
-                    '--disable-images',  # Faster loading
-                    '--disable-javascript-harmony-shipping',
-                    '--disable-background-timer-throttling',
-                    '--disable-renderer-backgrounding',
-                    '--disable-backgrounding-occluded-windows',
-                    '--disable-client-side-phishing-detection',
-                    '--disable-sync',
-                    '--disable-translate',
-                    '--hide-scrollbars',
-                    '--mute-audio'
-                ]
-            )
+        """Initialize browser with optimal settings, ensuring only one instance."""
+        async with self.lock:
+            if not self.browser or not self.browser.isConnected():
+                if self.browser: # Attempt to close previous faulty browser
+                    logger.warning("Previous browser instance found disconnected or problematic. Attempting to close.")
+                    try:
+                        await self.browser.close()
+                    except Exception as e:
+                        logger.warning(f"Error closing previous browser instance: {e}")
+                    self.browser = None # Clear it
+                logger.info("Initializing new Pyppeteer browser instance.")
+                try:
+                    self.browser = await pyppeteer.launch(
+                        headless=True,
+                        args=[
+                            '--no-sandbox',
+                            '--disable-setuid-sandbox',
+                            '--disable-dev-shm-usage',
+                            '--disable-accelerated-2d-canvas',
+                            '--disable-gpu',
+                            '--window-size=1920x1080',
+                            '--disable-extensions',
+                            '--disable-plugins-discovery',
+                            '--disable-images',
+                            '--disable-media-source',
+                            '--disable-audio-output',
+                            '--mute-audio',
+                            '--disable-ipc-flooding-protection',
+                            '--disable-background-timer-throttling',
+                            '--disable-renderer-backgrounding',
+                        ],
+                    )
+                    logger.info(f"Browser initialized. Version: {await self.browser.version()}")
+                except Exception as e:
+                    logger.error(f"Failed to launch browser: {e}", exc_info=True)
+                    self.browser = None # Ensure it's None if launch failed
+                    raise # Re-raise to signal failure
+            else:
+                logger.debug("Reusing existing browser instance.")
         return self.browser
 
     async def close_browser(self):
-        """Clean up browser resources"""
-        if self.browser:
-            await self.browser.close()
-            self.browser = None
+        """Clean up browser resources if it exists."""
+        async with self.lock:
+            if self.browser and self.browser.isConnected():
+                logger.info("Closing browser instance.")
+                try:
+                    await self.browser.close()
+                except Exception as e:
+                    logger.error(f"Error during browser close: {e}")
+                self.browser = None
+            elif self.browser:
+                logger.warning("Browser instance was not connected. Setting to None.")
+                self.browser = None
 
-    async def wait_for_dynamic_content(self, page, max_wait=10):
-        """Smart waiting for dynamic content to load"""
+    async def wait_for_page_load_or_change(self, page, timeout_seconds=10, stability_checks=2, check_interval=0.75, previous_content_hash=None):
+        """Waits for page height/content stabilization or network idle."""
+        logger.debug(f"Smart wait started for {page.url} (timeout: {timeout_seconds}s)")
         start_time = datetime.now()
-        last_height = 0
-        stable_count = 0
-        
-        while (datetime.now() - start_time).seconds < max_wait:
-            # Check if page height has stabilized
-            current_height = await page.evaluate('document.body.scrollHeight')
-            
-            if current_height == last_height:
-                stable_count += 1
-                if stable_count >= 3:  # Height stable for 3 checks
-                    break
-            else:
-                stable_count = 0
-                last_height = current_height
-            
-            await asyncio.sleep(0.5)
-
-    async def interact_with_elements(self, page, config):
-        """Comprehensive element interaction based on configuration"""
-        interactions = []
+        last_height = await page.evaluate('document.body.scrollHeight')
+        stable_height_count = 0
         
         try:
-            # Expand accordions and collapsible content
-            if config.get('expand_accordions', True):
-                accordion_result = await page.evaluate("""
-                    () => {
-                        let count = 0;
-                        // Standard accordion patterns
-                        const selectors = [
-                            'button[aria-expanded="false"]',
-                            '[data-toggle="collapse"]',
-                            '.accordion-button.collapsed',
-                            '.collapsible:not(.active)',
-                            'details:not([open])',
-                            '[role="button"][aria-expanded="false"]',
-                            '.expand-btn, .toggle-btn',
-                            '[data-bs-toggle="collapse"]',
-                            '[data-target]:not(.active)',
-                            '.dropdown-toggle:not(.show)'
-                        ];
-                        
-                        selectors.forEach(selector => {
-                            document.querySelectorAll(selector).forEach(el => {
-                                try {
-                                    if (el.tagName === 'DETAILS') {
-                                        el.open = true;
-                                    } else {
-                                        el.click();
-                                    }
-                                    count++;
-                                } catch (e) {
-                                    console.log('Failed to click:', selector, e);
-                                }
-                            });
-                        });
-                        
-                        return count;
-                    }
-                """)
-                interactions.append(f"Expanded {accordion_result} accordion/collapsible elements")
-
-            # Handle tabs and tab panels
-            if config.get('activate_tabs', True):
-                tab_result = await page.evaluate("""
-                    () => {
-                        let count = 0;
-                        const tabSelectors = [
-                            '.tab:not(.active)',
-                            '.nav-tab:not(.active)',
-                            '[role="tab"]:not([aria-selected="true"])',
-                            '.tab-button:not(.selected)',
-                            '[data-toggle="tab"]',
-                            '.ui-tabs-tab:not(.ui-tabs-active)'
-                        ];
-                        
-                        tabSelectors.forEach(selector => {
-                            document.querySelectorAll(selector).forEach(tab => {
-                                try {
-                                    tab.click();
-                                    count++;
-                                } catch (e) {
-                                    console.log('Failed to activate tab:', e);
-                                }
-                            });
-                        });
-                        
-                        return count;
-                    }
-                """)
-                interactions.append(f"Activated {tab_result} tabs")
-
-            # Trigger lazy loading
-            if config.get('trigger_lazy_loading', True):
-                lazy_result = await page.evaluate("""
-                    () => {
-                        let count = 0;
-                        // Scroll to trigger lazy loading
-                        const lazyElements = document.querySelectorAll(
-                            '[data-src], [loading="lazy"], .lazy, .lazyload, [data-lazy]'
-                        );
-                        
-                        lazyElements.forEach(el => {
-                            el.scrollIntoView({ behavior: 'instant', block: 'center' });
-                            count++;
-                        });
-                        
-                        // Trigger scroll events
-                        window.dispatchEvent(new Event('scroll'));
-                        window.dispatchEvent(new Event('resize'));
-                        
-                        return count;
-                    }
-                """)
-                interactions.append(f"Triggered lazy loading for {lazy_result} elements")
-
-            # Handle modals and popups (but don't actually open them, just prepare)
-            if config.get('prepare_modals', True):
-                modal_result = await page.evaluate("""
-                    () => {
-                        let count = 0;
-                        // Find modal triggers and add visibility styles
-                        const modalSelectors = [
-                            '[data-toggle="modal"]',
-                            '[data-bs-toggle="modal"]',
-                            '.modal-trigger',
-                            '[href*="#modal"]'
-                        ];
-                        
-                        modalSelectors.forEach(selector => {
-                            document.querySelectorAll(selector).forEach(trigger => {
-                                const targetId = trigger.getAttribute('data-target') || 
-                                               trigger.getAttribute('data-bs-target') ||
-                                               trigger.getAttribute('href');
-                                
-                                if (targetId && targetId.startsWith('#')) {
-                                    const modal = document.querySelector(targetId);
-                                    if (modal) {
-                                        modal.style.display = 'block';
-                                        modal.style.visibility = 'visible';
-                                        modal.style.opacity = '1';
-                                        count++;
-                                    }
-                                }
-                            });
-                        });
-                        
-                        return count;
-                    }
-                """)
-                interactions.append(f"Prepared {modal_result} modals for visibility")
-
-            # Expand select dropdowns (show options)
-            if config.get('expand_selects', False):  # Default false as it can be disruptive
-                select_result = await page.evaluate("""
-                    () => {
-                        let count = 0;
-                        document.querySelectorAll('select').forEach(select => {
-                            try {
-                                // Make options visible by temporarily expanding
-                                select.setAttribute('size', Math.min(select.options.length, 10));
-                                count++;
-                            } catch (e) {
-                                console.log('Failed to expand select:', e);
-                            }
-                        });
-                        return count;
-                    }
-                """)
-                interactions.append(f"Expanded {select_result} select dropdowns")
-
-            # Trigger hover states for menus
-            if config.get('trigger_hover_menus', True):
-                hover_result = await page.evaluate("""
-                    () => {
-                        let count = 0;
-                        const hoverSelectors = [
-                            '.dropdown:not(.show)',
-                            '.menu-item-has-children',
-                            '[data-hover="dropdown"]',
-                            '.nav-item.dropdown'
-                        ];
-                        
-                        hoverSelectors.forEach(selector => {
-                            document.querySelectorAll(selector).forEach(el => {
-                                try {
-                                    // Simulate hover
-                                    el.classList.add('hover', 'show', 'active');
-                                    const submenu = el.querySelector('.dropdown-menu, .sub-menu, .submenu');
-                                    if (submenu) {
-                                        submenu.style.display = 'block';
-                                        submenu.style.visibility = 'visible';
-                                        submenu.style.opacity = '1';
-                                    }
-                                    count++;
-                                } catch (e) {
-                                    console.log('Failed to trigger hover:', e);
-                                }
-                            });
-                        });
-                        return count;
-                    }
-                """)
-                interactions.append(f"Triggered hover states for {hover_result} menu elements")
-
-            # Execute custom JavaScript if provided
-            if config.get('custom_js'):
-                try:
-                    custom_result = await page.evaluate(config['custom_js'])
-                    interactions.append(f"Executed custom JavaScript: {custom_result}")
-                except Exception as e:
-                    interactions.append(f"Custom JavaScript failed: {str(e)}")
-
+            await page.waitForNavigation({'waitUntil': 'networkidle0', 'timeout': 3000})
+            logger.debug(f"Network became idle for {page.url}")
+        except pyppeteer.errors.TimeoutError:
+            logger.debug(f"Network not idle within 3s for {page.url}, continuing with content checks.")
         except Exception as e:
-            logger.error(f"Error during element interaction: {str(e)}")
-            interactions.append(f"Error: {str(e)}")
+            logger.warning(f"Minor error during networkidle0 check for {page.url}: {e}")
 
-        return interactions
+        while (datetime.now() - start_time).total_seconds() < timeout_seconds:
+            current_height = await page.evaluate('document.body.scrollHeight')
+            if current_height == last_height:
+                stable_height_count += 1
+                if stable_height_count >= stability_checks:
+                    if previous_content_hash:
+                        current_content_hash = hash(await page.content())
+                        if current_content_hash != previous_content_hash:
+                            stable_height_count = 0
+                            previous_content_hash = current_content_hash
+                        else:
+                            break
+                    else:
+                        break
+            else:
+                stable_height_count = 0
+                last_height = current_height
+                if previous_content_hash:
+                     previous_content_hash = hash(await page.content())
+
+            await asyncio.sleep(check_interval)
+        
+        elapsed = (datetime.now() - start_time).total_seconds()
+        logger.debug(f"Smart wait for {page.url} finished after {elapsed:.2f}s.")
+        return previous_content_hash
+
+    async def interact_with_elements(self, page, interactions_config):
+        """Performs interactions based on config."""
+        performed_interactions = []
+        if not interactions_config: return performed_interactions
+        logger.debug(f"Interacting on {page.url} with config: {interactions_config}")
+
+        if interactions_config.get('activate_tabs', True):
+            tab_selectors = interactions_config.get('tab_selectors_to_activate', [
+                'li.ui-tabs-tab:not(.ui-tabs-active) a.ui-tabs-anchor',
+                '.tab:not(.active) a', '.nav-tab:not(.active) a',
+                '[role="tab"]:not([aria-selected="true"])'
+            ])
+            script = f"""
+                async () => {{
+                    let count = 0;
+                    const selectors = {json.dumps(tab_selectors)};
+                    for (const selector of selectors) {{
+                        for (const el of document.querySelectorAll(selector)) {{
+                            const style = window.getComputedStyle(el);
+                            if (style.display !== 'none' && style.visibility !== 'hidden') {{
+                                el.click();
+                                count++;
+                                await new Promise(r => setTimeout(r, 100));
+                            }}
+                        }}
+                    }}
+                    return count;
+                }}
+            """
+            try:
+                clicked_count = await page.evaluate(script)
+                if clicked_count > 0:
+                    performed_interactions.append(f"Activated {clicked_count} tab(s).")
+                    await self.wait_for_page_load_or_change(page, timeout_seconds=5)
+            except Exception as e:
+                logger.error(f"Error activating tabs on {page.url}: {e}")
+                performed_interactions.append(f"Error activating tabs: {str(e)}")
+        
+        if interactions_config.get('custom_js'):
+            try:
+                result = await page.evaluate(interactions_config['custom_js'])
+                performed_interactions.append(f"Executed custom_js. Result: {str(result)[:100]}")
+                await self.wait_for_page_load_or_change(page, timeout_seconds=interactions_config.get('post_custom_js_wait_s', 5))
+            except Exception as e:
+                logger.error(f"Error executing custom_js on {page.url}: {e}")
+                performed_interactions.append(f"Error in custom_js: {str(e)}")
+        
+        return performed_interactions
+
+    async def _create_page_and_navigate(self, browser, url, page_load_config):
+        page = await browser.newPage()
+        await page.setViewport(page_load_config.get('viewport', {'width': 1920, 'height': 1080}))
+        if page_load_config.get('user_agent'):
+            await page.setUserAgent(page_load_config['user_agent'])
+        
+        logger.info(f"Navigating new page to: {url}")
+        await page.goto(url, {'waitUntil': page_load_config.get('wait_until', 'networkidle0'), 'timeout': page_load_config.get('timeout_ms', 30000)})
+        return page
 
     async def render_page(self, url, config):
-        """Main page rendering function with advanced interactions"""
+        """Renders a single page with interactions."""
         page = None
         try:
             browser = await self.init_browser()
-            page = await browser.newPage()
-            
-            # Set viewport and user agent
-            await page.setViewport({
-                'width': config.get('viewport_width', 1920),
-                'height': config.get('viewport_height', 1080)
-            })
-            
-            if config.get('user_agent'):
-                await page.setUserAgent(config['user_agent'])
-            
-            # Navigate to page
-            logger.info(f"Navigating to: {url}")
-            await page.goto(url, {
-                'waitUntil': config.get('wait_until', 'networkidle0'),
-                'timeout': config.get('timeout', 30000)
-            })
-            
-            # Wait for initial content
-            await self.wait_for_dynamic_content(page, config.get('max_wait', 10))
-            
-            # Perform interactions
-            interactions = await self.interact_with_elements(page, config)
-            
-            # Wait again after interactions
-            await asyncio.sleep(config.get('post_interaction_wait', 2))
-            await self.wait_for_dynamic_content(page, 5)
-            
-            # Get final HTML
-            html = await page.content()
-            
-            # Get page metrics
-            metrics = await page.metrics()
-            
-            return {
-                'html': html,
-                'interactions': interactions,
-                'metrics': metrics,
-                'url': url,
-                'timestamp': datetime.now().isoformat()
-            }
-            
+            if not browser: return {'error': "Browser not initialized", 'url': url}
+            page = await self._create_page_and_navigate(browser, url, config.get('page_load_config', {}))
+            await self.wait_for_page_load_or_change(page, config.get('page_load_config', {}).get('max_wait_initial_s', 10))
+            interactions_log = await self.interact_with_elements(page, config.get('interactions_config'))
+            html_content = await page.content()
+            return {'html': html_content, 'interactions': interactions_log, 'url': page.url, 'timestamp': datetime.now().isoformat()}
         except Exception as e:
-            logger.error(f"Failed to render {url}: {str(e)}")
-            return None
+            logger.error(f"render_page failed for {url}: {e}", exc_info=True)
+            return {'error': str(e), 'url': url}
         finally:
-            if page:
-                await page.close()
+            if page: await page.close()
 
-# Global renderer instance
-renderer = AdvancedRenderer()
+    async def render_paginated_table(self, url, pagination_config):
+        page = None
+        collected_html_parts = []
+        full_interaction_log = []
+        try:
+            browser = await self.init_browser()
+            if not browser: return {"status": "error", "message": "Browser not initialized", 'url': url}
+            page = await self._create_page_and_navigate(browser, url, pagination_config.get('page_load_config', {}))
+            
+            if initial_interactions_cfg := pagination_config.get('initial_interactions_config'):
+                await self.wait_for_page_load_or_change(page, pagination_config.get('page_load_config', {}).get('max_wait_initial_s', 10))
+                full_interaction_log.extend(await self.interact_with_elements(page, initial_interactions_cfg))
+            
+            previous_content_hash = None
+            for page_num in range(1, pagination_config.get('max_pages', 10) + 1):
+                logger.info(f"Processing page {page_num} for paginated table at {page.url}")
+                previous_content_hash = await self.wait_for_page_load_or_change(page, pagination_config.get('wait_s_per_page', 7), previous_content_hash=previous_content_hash)
+                
+                if current_table_part_html := await page.evaluate(f"(sel) => document.querySelector(sel)?.outerHTML || null", pagination_config['table_content_selector']):
+                    collected_html_parts.append(current_table_part_html)
+                else:
+                    logger.warning(f"Selector '{pagination_config['table_content_selector']}' not found on page {page_num} of {page.url}.")
+
+                next_button_status = await page.evaluate(f"""
+                    (sel) => {{
+                        const btn = document.querySelector(sel);
+                        if (!btn) return {{ found: false }};
+                        const style = window.getComputedStyle(btn);
+                        const isDisabled = btn.hasAttribute('disabled') || btn.classList.contains('disabled') || btn.classList.contains('paginationjs-disabled') || (btn.closest('li') && (btn.closest('li').classList.contains('disabled') || btn.closest('li').classList.contains('paginationjs-disabled')));
+                        return {{ found: true, disabled: isDisabled, visible: style.display !== 'none' && style.visibility !== 'hidden' }};
+                    }}
+                """, pagination_config['next_page_selector'])
+                
+                if not next_button_status.get('found') or not next_button_status.get('visible') or next_button_status.get('disabled'):
+                    logger.info(f"Next page button condition met for stopping at page {page_num}.")
+                    break
+                
+                if page_num == pagination_config.get('max_pages', 10): break
+                
+                await page.evaluate(f"(sel) => document.querySelector(sel).click()", pagination_config['next_page_selector'])
+                full_interaction_log.append(f"Clicked next page ({page_num} -> {page_num + 1})")
+                await asyncio.sleep(pagination_config.get('post_click_delay_ms', 200) / 1000.0)
+
+            return {'status': 'success', 'url': url, 'pages_processed': len(collected_html_parts), 'table_pages_html': collected_html_parts, 'interactions': full_interaction_log}
+        except Exception as e:
+            logger.error(f"render_paginated_table for {url} failed: {e}", exc_info=True)
+            return {'status': 'error', 'message': str(e), 'url': url}
+        finally:
+            if page: await page.close()
+
+# --- Flask Endpoints ---
+renderer_instance = AdvancedRenderer()
 
 @app.route('/render', methods=['POST'])
-def render_html():
-    """Enhanced render endpoint with comprehensive configuration"""
-    try:
-        data = request.get_json()
-        url = data.get('url')
-        
-        if not url:
-            return jsonify({"error": "URL is required"}), 400
-        
-        # Configuration with sensible defaults
-        config = {
-            'timeout': data.get('timeout', 30000),
-            'viewport_width': data.get('viewport_width', 1920),
-            'viewport_height': data.get('viewport_height', 1080),
-            'wait_until': data.get('wait_until', 'networkidle0'),
-            'max_wait': data.get('max_wait', 10),
-            'post_interaction_wait': data.get('post_interaction_wait', 2),
-            'user_agent': data.get('user_agent'),
-            
-            # Interaction options
-            'expand_accordions': data.get('expand_accordions', True),
-            'activate_tabs': data.get('activate_tabs', True),
-            'trigger_lazy_loading': data.get('trigger_lazy_loading', True),
-            'prepare_modals': data.get('prepare_modals', True),
-            'expand_selects': data.get('expand_selects', False),
-            'trigger_hover_menus': data.get('trigger_hover_menus', True),
-            'custom_js': data.get('custom_js')
-        }
-        
-        # Render page
-        result = asyncio.run(renderer.render_page(url, config))
-        
-        if result:
-            # Return different response formats based on request
-            if data.get('include_metadata', False):
-                return jsonify(result)
-            else:
-                return jsonify({"html": result['html']})
-        else:
-            return jsonify({"error": "Failed to render HTML"}), 500
-            
-    except Exception as e:
-        logger.error(f"Error processing request: {str(e)}")
-        return jsonify({"error": str(e)}), 500
+def render_endpoint_sync():
+    data = request.get_json()
+    if not data or 'url' not in data:
+        return jsonify({"error": "URL is required"}), 400
+    return jsonify(asyncio.run(renderer_instance.render_page(data['url'], data)))
+
+@app.route('/render_paginated_sync', methods=['POST'])
+def render_paginated_sync_endpoint():
+    data = request.get_json()
+    if not data or 'url' not in data or 'next_page_selector' not in data or 'table_content_selector' not in data:
+        return jsonify({"error": "url, next_page_selector, and table_content_selector are required"}), 400
+    return jsonify(asyncio.run(renderer_instance.render_paginated_table(data['url'], data)))
 
 @app.route('/health', methods=['GET'])
 def health_check():
-    """Health check endpoint"""
     return jsonify({"status": "healthy", "timestamp": datetime.now().isoformat()})
 
-@app.route('/config', methods=['GET'])
-def get_config_info():
-    """Return available configuration options"""
-    config_info = {
-        "basic_options": {
-            "timeout": "Request timeout in milliseconds (default: 30000)",
-            "viewport_width": "Browser viewport width (default: 1920)",
-            "viewport_height": "Browser viewport height (default: 1080)",
-            "wait_until": "Wait condition: networkidle0, networkidle2, load, domcontentloaded",
-            "max_wait": "Maximum wait time for dynamic content (seconds)",
-            "user_agent": "Custom user agent string"
-        },
-        "interaction_options": {
-            "expand_accordions": "Expand accordion/collapsible content (default: true)",
-            "activate_tabs": "Click on inactive tabs (default: true)",
-            "trigger_lazy_loading": "Trigger lazy loading elements (default: true)",
-            "prepare_modals": "Make modal content visible (default: true)",
-            "expand_selects": "Show select dropdown options (default: false)",
-            "trigger_hover_menus": "Show hover menus (default: true)",
-            "custom_js": "Custom JavaScript code to execute"
-        },
-        "response_options": {
-            "include_metadata": "Include interaction details and metrics (default: false)"
-        }
-    }
-    return jsonify(config_info)
-
-# Cleanup on shutdown
-import atexit
-
+# --- Application Lifecycle ---
 @atexit.register
-def cleanup():
+def shutdown_signal_handler():
     try:
-        asyncio.run(renderer.close_browser())
-    except:
-        pass
+        logger.info("atexit: Attempting async cleanup.")
+        asyncio.run(renderer_instance.close_browser())
+    except Exception as e:
+        logger.error(f"atexit: Error during shutdown: {e}")
 
 if __name__ == '__main__':
     port = int(os.environ.get('PORT', 8080))
+    logger.info(f"Starting Flask app on port {port}")
+    # Note: For production, use a proper WSGI server like Gunicorn
     app.run(host='0.0.0.0', port=port, debug=False)

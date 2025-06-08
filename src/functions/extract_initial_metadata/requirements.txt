@@ -1,8 +1,23 @@
-functions-framework==3.7.0
-google-cloud-firestore==2.17.2
-google-cloud-pubsub==2.23.0
-google-cloud-storage==2.18.2
-google-cloud-secret-manager==2.20.2
-google-cloud-logging==3.10.0
-google-cloud-aiplatform==1.60.0
-beautifulsoup4==4.12.3
+# Core dependencies
+functions-framework==3.*
+google-cloud-storage==2.*
+google-cloud-firestore==2.*
+google-cloud-pubsub==2.*
+google-cloud-secret-manager>=2.16.0
+google-cloud-logging
+
+# Data processing - use compatible versions
+numpy==1.24.3
+pandas==2.0.3
+
+# Web scraping and parsing
+requests==2.31.0
+beautifulsoup4==4.12.2
+lxml==4.9.3
+pdfplumber==0.9.0
+
+# AI/ML (if needed)
+google-cloud-aiplatform==1.26.1
+
+# Utilities
+python-dateutil==2.8.2

@@ -6,7 +6,7 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 try:
-    db = firestore.Client(project="execo-harvey", database="harvey-au")
+    db = firestore.Client(project="execo-simba", database="harvey-au")
     doc_ref = db.collection("netherlands").document("test")
     # Define retry policy for transient errors
     retry_policy = Retry(predicate=lambda exc: isinstance(exc, Exception), initial=1.0, maximum=60.0)

@@ -1,0 +1,196 @@
+{
+  "project_name": "fedao_project",
+  "project_abbreviation": "FEDAO",
+  "customer_id": "simba",
+  "description": "Federal Reserve Bank of New York - Fed Announced Operations (Individual Operations Format)",
+  "firestore_collection": "fedao_documents",
+  "firestore_counters_collection": "fedao_counters",
+  "pipeline_version_tag": "1.0.2",
+  "sequential_id_config": {
+    "enabled": true,
+    "firestore_counters_collection": "fedao_counters",
+    "counter_doc_prefix": "FEDAO_id_sequence"
+  },
+  "fedao_input_configs": {
+    "FEDAO_MOA_RAW_DATA": {
+      "data_type": "MOA",
+      "transformations": [
+        {
+          "type": "add_source_date",
+          "date_source_column": "OPERATION DATE",
+          "description": "Calculate Source_Date from latest operation date in YYYYMMDD format"
+        },
+        {
+          "type": "standardize_moa_format",
+          "description": "Convert to exact expected MOA output format including MAXIMUMOPERATIONSIZE"
+        }
+      ],
+      "gcs_processed_path_root": "FEDAO/processed_csvs",
+      "gcs_incremental_path_root": "FEDAO/master_data",
+      "master_filename_template": "FEDAO_MOA_DATA.csv",
+      "output_document_type": "FEDAO_MOA_ITEM",
+      "expected_output_format": "individual_operation_records"
+    },
+    "FEDAO_TOA_RAW_DATA": {
+      "data_type": "TOA",
+      "transformations": [
+        {
+          "type": "add_source_date",
+          "date_source_column": "DATE",
+          "description": "Calculate Source_Date from latest operation date in YYYYMMDD format"
+        },
+        {
+          "type": "standardize_toa_format",
+          "description": "Convert to expected TOA output format"
+        },
+        {
+          "type": "split_rows_cusip_max",
+          "description": "Split multi-line CUSIP/amount cells into separate operation rows"
+        }
+      ],
+      "gcs_processed_path_root": "FEDAO/processed_csvs",
+      "gcs_incremental_path_root": "FEDAO/master_data",
+      "master_filename_template": "FEDAO_TOA_DATA.csv",
+      "output_document_type": "FEDAO_TOA_ITEM",
+      "expected_output_format": "individual_operation_records"
+    }
+  },
+  "field_mappings": {
+    "_comment_field_mappings": "These mappings are primarily for the extract_initial_metadata function, which is no longer directly triggered by transform_fedao_csv for this CSV flow.",
+    "Operation_Type": {"source": "OPERATION TYPE"},
+    "Security_Type": {"source": "SECURITY TYPE AND MATURITY"},
+    "Operation_Date": {"source": "OPERATION DATE || DATE"},
+    "Settlement_Date": {"source": "SETTLEMENT DATE"},
+    "Operation_Time": {"source": "OPERATION TIME(ET) || OPERATION TIME"},
+    "Maturity_Range": {"source": "MATURITY RANGE"},
+    "Maximum_Operation_Currency": {"source": "MAXIMUM OPERATION CURRENCY"},
+    "Maximum_Operation_Size": {"source": "MAXIMUMOPERATIONSIZE"},
+    "Maximum_Operation_Multiplier": {"source": "MAXIMUM OPERATION MULTIPLIER"},
+    "CUSIP": {"source": "CUSIP || Securities Included (CUSIP)"},
+    "Security_Maximum": {"source": "MAXIMUM PURCHASE AMOUNT || Security Maximums (Millions)"},
+    "Source_Date_Field": {"source": "Source_Date"}
+  },
+  "fedao_config": {
+    "_comment_fedao_config": "Parts of this section (e.g., title_source_columns, defaults) are for extract_initial_metadata.",
+    "title_source_columns": ["OPERATION TYPE", "SECURITY TYPE AND MATURITY"],
+    "default_topics": ["Federal Reserve Operations", "Treasury Securities", "Monetary Policy"],
+    "default_legislation": ["Federal Reserve Act"],
+    "expected_moa_columns": [
+      "OPERATION DATE", "OPERATION TIME(ET)", "SETTLEMENT DATE", "OPERATION TYPE",
+      "SECURITY TYPE AND MATURITY", "MATURITY RANGE", "MAXIMUM OPERATION CURRENCY",
+      "MAXIMUMOPERATIONSIZE", "MAXIMUM OPERATION MULTIPLIER", "Source_Date"
+    ],
+    "expected_toa_columns": [
+      "DATE", "OPERATION TYPE", "SECURITY TYPE AND MATURITY", "CUSIP",
+      "MAXIMUM PURCHASE AMOUNT", "Source_Date"
+    ],
+    "date_formats": {
+      "source_date_output": "YYYYMMDD",
+      "operation_date_input_parser": "flexible (tries ISO, YYYY-MM-DD, MM/DD/YYYY, etc.)",
+      "operation_date_scraper_output": "YYYY-MM-DDTHH:MM:SS.sssZ"
+    },
+    "data_validation_rules": {
+      "_comment": "Conceptual validation rules, not all enforced by current scripts directly.",
+      "moa_required_fields": ["OPERATION DATE", "OPERATION TYPE"],
+      "toa_required_fields": ["DATE", "OPERATION TYPE"],
+      "numeric_fields": ["MAXIMUMOPERATIONSIZE"],
+      "date_fields": ["OPERATION DATE", "SETTLEMENT DATE", "DATE"],
+      "currency_symbols": ["$", "€", "£", "¥"],
+      "multipliers": ["million", "billion"]
+    }
+  },
+  "master_file_config": {
+    "_comment": "Specific master file paths are now in fedao_input_configs. This section can hold general master file policies if needed elsewhere.",
+    "backup_enabled": true,
+    "backup_path_template": "FEDAO/master_data/backups/{date_str}/",
+    "validation_enabled": false,
+    "max_master_file_size_mb": 100
+  },
+  "pubsub_topics": {
+    "_comment_extract_topic": "extract_initial_metadata_from_csv_row_topic is no longer used by transform_fedao_csv.",
+    "extract_initial_metadata_from_csv_row_topic": "extract-initial-metadata-topic",
+    "fetch_content_topic": "fetch-content-topic",
+    "generate_xml_topic": "generate-xml-topic"
+  },
+  "ai_metadata_extraction": {
+    "enabled": false,
+    "reason": "FEDAO data is structured CSV, no AI extraction needed for this workflow."
+  },
+  "data_quality_rules": {
+    "_comment_dedup": "Deduplication columns for master files are defined in transform_fedao_csv, this config is for reference/future use.",
+    "moa_deduplication_columns": ["OPERATION DATE", "OPERATION TYPE", "SECURITY TYPE AND MATURITY", "OPERATION TIME(ET)"],
+    "toa_deduplication_columns": ["DATE", "OPERATION TYPE", "CUSIP", "MAXIMUM PURCHASE AMOUNT"],
+    "required_operation_fields": {
+      "moa": ["OPERATION DATE", "OPERATION TYPE"],
+      "toa": ["DATE", "OPERATION TYPE"]
+    }
+  },
+  "scraping_config": {
+    "primary_data_sources": {
+      "moa": "current_schedule_html_table_and_monthly_details_html_table",
+      "toa": "ambs_page_html_tables"
+    },
+    "secondary_data_sources": {
+      "moa": "none_pdf_processing_disabled",
+      "toa": "none_pdf_processing_disabled"
+    },
+    "date_parsing": {
+      "input_formats_handled_by_parser": ["MM/DD/YYYY", "YYYY-MM-DD", "Month D, YYYY", "ISO with T and Z"],
+      "scraper_output_format": "YYYY-MM-DDTHH:MM:SS.sssZ"
+    },
+    "pdf_processing": {
+      "enabled": false,
+      "reason": "Disabled to prevent extra columns and focus on HTML table data",
+      "pdf_limit_per_source": 0,
+      "max_operations_per_pdf": 0,
+      "timeout_seconds": 0
+    }
+  },
+  "output_validation": {
+    "_comment_validation": "Schema for final CSVs. transform_fedao_csv attempts to produce this.",
+    "moa_schema": {
+      "required_columns": [
+        "OPERATION DATE", "OPERATION TIME(ET)", "SETTLEMENT DATE", "OPERATION TYPE",
+        "SECURITY TYPE AND MATURITY", "MATURITY RANGE", "MAXIMUM OPERATION CURRENCY",
+        "MAXIMUMOPERATIONSIZE", "MAXIMUM OPERATION MULTIPLIER", "Source_Date"
+      ],
+      "column_types": {
+        "OPERATION DATE": "string_iso_datetime", "SETTLEMENT DATE": "string_iso_datetime",
+        "MAXIMUMOPERATIONSIZE": "numeric_float", "Source_Date": "string_yyyymmdd"
+      }
+    },
+    "toa_schema": {
+      "required_columns": [
+        "DATE", "OPERATION TYPE", "SECURITY TYPE AND MATURITY", "CUSIP",
+        "MAXIMUM PURCHASE AMOUNT", "Source_Date"
+      ],
+      "column_types": {
+        "DATE": "string_iso_datetime", "Source_Date": "string_yyyymmdd"
+      }
+    }
+  },
+  "environment_variables": {
+    "FEDAO_TREASURY_URL": "https://www.newyorkfed.org/markets/domestic-market-operations/monetary-policy-implementation/treasury-securities/treasury-securities-operational-details",
+    "FEDAO_AMBS_URL": "https://www.newyorkfed.org/markets/ambs_operation_schedule#tabs-2",
+    "FEDAO_OUTPUT_BUCKET": "execo-simba-fedao-poc",
+    "PDF_PROCESSING_LIMIT": "0",
+    "CUSTOMER_ID_FOR_FEDAO": "simba",
+    "LOG_LEVEL": "INFO"
+  },
+  "compliance_notes": {
+    "runbook_version": "FEDAO_Runbook_v1.0_adapted_for_html_scraping_only",
+    "expected_output_master_files": ["FEDAO_MOA_DATA.csv", "FEDAO_TOA_DATA.csv"],
+    "data_structure": "Individual operation records, not period summaries",
+    "key_requirements_from_runbook": [
+      "MAXIMUMOPERATIONSIZE column name (no underscores) for MOA numerical value.",
+      "MAXIMUM OPERATION CURRENCY and MAXIMUM OPERATION MULTIPLIER for MOA.",
+      "MAXIMUM PURCHASE AMOUNT for TOA (can be text like '$X million').",
+      "OPERATION TIME(ET) column name with parentheses for MOA.",
+      "Source_Date field in YYYYMMDD format derived from latest operation date.",
+      "Operation dates from scraper output in YYYY-MM-DDTHH:MM:SS.sssZ format.",
+      "Individual operation records per row.",
+      "Incremental master file updates with proper deduplication.",
+      "HTML table extraction only - PDF processing disabled to maintain clean column structure."
+    ]
+  }
+}

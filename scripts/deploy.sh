@@ -1,16 +1,22 @@
 #!/bin/bash
 
+# Enhanced FEDAO Deployment Script
 # Configuration variables
-PROJECT_ID="execo-harvey"
+PROJECT_ID="execo-simba"
 REGION="europe-west1"
+ARTIFACT_REGISTRY_REGION="europe-west1"
+ARTIFACT_REGISTRY_REPO="pdf-pipeline-services"
 SERVICE_ACCOUNT="scraper-service-account@$PROJECT_ID.iam.gserviceaccount.com"
 TOP_LEVEL_SRC_DIR="src"
 LOG_DIR="logs"
 LOG_FILE="$LOG_DIR/deploy_$(date +%Y%m%d_%H%M%S).log"
-PROJECT_CONFIGS=(
-  "$TOP_LEVEL_SRC_DIR/configs/projects/germany_federal_law.json"
-  "$TOP_LEVEL_SRC_DIR/configs/projects/asic_downloads.json"
-)
+
+# FEDAO specific
+FEDAO_RAW_CSV_BUCKET_NAME="execo-simba-fedao-poc"
+
+# Service names
+WEB_RENDERER_SERVICE_NAME="advanced-web-renderer"
+ANALYZE_SCHEMA_FUNCTION_NAME="analyze-website-schema"
 
 # Create log directory
 mkdir -p "$LOG_DIR"
@@ -18,70 +24,46 @@ mkdir -p "$LOG_DIR"
 # Exit on error
 set -e
 
-# Check for jq
-if ! command -v jq &> /dev/null; then
-  echo "Error: jq is required. Install it with 'brew install jq' (macOS) or 'sudo apt-get install jq' (Ubuntu)." | tee -a "$LOG_FILE"
-  exit 1
-fi
-
-# Check quota project in ADC
-check_quota_project() {
-  echo "Checking Application Default Credentials quota project..." | tee -a "$LOG_FILE"
-  ADC_FILE="$HOME/.config/gcloud/application_default_credentials.json"
-  if [ ! -f "$ADC_FILE" ]; then
-    echo "Error: ADC file $ADC_FILE not found. Run 'gcloud auth application-default login'." | tee -a "$LOG_FILE"
-    exit 1
-  fi
-  QUOTA_PROJECT=$(grep -o '"quota_project_id": "[^"]*"' "$ADC_FILE" | cut -d'"' -f4)
-  if [ "$QUOTA_PROJECT" != "$PROJECT_ID" ]; then
-    echo "Error: ADC quota project ($QUOTA_PROJECT) does not match active project ($PROJECT_ID)." | tee -a "$LOG_FILE"
-    echo "Run 'gcloud auth application-default set-quota-project $PROJECT_ID' to fix." | tee -a "$LOG_FILE"
-    exit 1
-  fi
-  echo "Quota project verified: $QUOTA_PROJECT" | tee -a "$LOG_FILE"
+# --- Helper Functions ---
+log_and_echo() {
+  echo "$1" | tee -a "$LOG_FILE"
 }
 
-# Check requirements.txt for critical dependencies
+check_command() {
+  if ! command -v "$1" &> /dev/null; then
+    log_and_echo "Error: $1 is required. Please install it."
+    exit 1
+  fi
+}
+
+# Check for required tools
+check_command "jq"
+check_command "gcloud"
+
+# Function to check requirements.txt
 check_requirements() {
-  local req_file="$1"
-  local function_name="$2"
+  local req_file_path="$1"
+  local component_name="$2"
   local actual_req_file
-  if [[ "$req_file" == temp_deploy_staging* ]]; then
-    actual_req_file="$req_file"
-  elif [ -f "$TOP_LEVEL_SRC_DIR/$req_file/requirements.txt" ]; then
-    actual_req_file="$TOP_LEVEL_SRC_DIR/$req_file/requirements.txt"
-  elif [ -f "$req_file" ]; then
-    actual_req_file="$req_file"
+
+  if [[ "$req_file_path" == temp_deploy_staging* ]]; then
+    actual_req_file="$req_file_path"
+  elif [ -f "$TOP_LEVEL_SRC_DIR/$req_file_path" ]; then
+    actual_req_file="$TOP_LEVEL_SRC_DIR/$req_file_path"
+  elif [ -f "$req_file_path" ]; then
+    actual_req_file="$req_file_path"
   else
-    echo "Error: requirements.txt path resolution failed for '$req_file' in function '$function_name'." | tee -a "$LOG_FILE"
+    log_and_echo "Error: requirements.txt path resolution failed for '$req_file_path' in '$component_name'."
     exit 1
   fi
 
-  if [ -f "$actual_req_file" ]; then
-    if ! grep -q "google-cloud-secret-manager" "$actual_req_file"; then
-      echo "Warning: google-cloud-secret-manager missing in $actual_req_file for $function_name." | tee -a "$LOG_FILE"
-    fi
-    if ! grep -q "google-cloud-logging" "$actual_req_file"; then
-      echo "Warning: google-cloud-logging missing in $actual_req_file for $function_name." | tee -a "$LOG_FILE"
-    fi
-    if [ "$function_name" = "retry-pipeline" ] || [ "$function_name" = "discover-main-urls" ] || [ "$function_name" = "extract-initial-metadata" ] && ! grep -q "google-cloud-aiplatform" "$actual_req_file"; then
-      echo "Warning: google-cloud-aiplatform missing in $actual_req_file for $function_name." | tee -a "$LOG_FILE"
-    fi
-    if [[ "$function_name" == *"discover-main-urls"* ]] || [[ "$function_name" == *"extract-initial-metadata"* ]] || [[ "$function_name" == *"fetch-content"* ]]; then
-      if ! grep -q "requests" "$actual_req_file"; then
-        echo "Warning: 'requests' missing in $actual_req_file for scraping function $function_name." | tee -a "$LOG_FILE"
-      fi
-      if ! grep -q "beautifulsoup4" "$actual_req_file"; then
-        echo "Warning: 'beautifulsoup4' missing in $actual_req_file for scraping function $function_name." | tee -a "$LOG_FILE"
-      fi
-    fi
-  else
-    echo "Error: requirements.txt not found at $actual_req_file for $function_name." | tee -a "$LOG_FILE"
+  if [ ! -f "$actual_req_file" ]; then
+    log_and_echo "Error: requirements.txt not found at $actual_req_file for $component_name."
     exit 1
   fi
 }
 
-# Deploy a single Cloud Function
+# Deploy a single Cloud Function with enhanced error handling
 deploy_single_function() {
   local function_name="$1"
   local entry_point_name="$2"
@@ -89,58 +71,43 @@ deploy_single_function() {
   local trigger_value="$4"
   local function_code_subdir="$5"
   local memory="$6"
-  local timeout="$7"
-  local function_log_file="$LOG_DIR/${function_name}_$(date +%Y%m%d_%H%M%S).log"
+  local timeout_seconds="$7"
+  local function_log_file="$LOG_DIR/${function_name}_deploy_$(date +%Y%m%d_%H%M%S).log"
   local gcs_event_type=""
+  local extra_env_vars="$8"
 
   if [ "$trigger_type" == "gcs" ]; then
-    gcs_event_type="$8"
+    gcs_event_type="${extra_env_vars}"
+    extra_env_vars=""
     if [ -z "$gcs_event_type" ]; then
-      echo "Error: GCS event type not provided for GCS trigger on $function_name." | tee -a "$LOG_FILE"
+      log_and_echo "Error: GCS event type not provided for GCS trigger on $function_name."
       exit 1
     fi
   fi
 
-  echo "Preparing deployment for $function_name..." | tee -a "$LOG_FILE"
-  echo "Preparing deployment for $function_name..." >> "$function_log_file"
+  log_and_echo "Preparing deployment for Cloud Function: $function_name..."
+  echo "Deployment log for $function_name: $function_log_file" >> "$LOG_FILE"
 
-  function_code_subdir=$(echo "$function_code_subdir" | sed 's|//|/|g')
   local staging_dir="temp_deploy_staging/$function_name"
+  rm -rf "$staging_dir" && mkdir -p "$staging_dir"
 
-  if [ -d "$staging_dir" ]; then
-    rm -rf "$staging_dir"
-  fi
-  mkdir -p "$staging_dir"
-
-  if [ ! -d "$TOP_LEVEL_SRC_DIR/$function_code_subdir" ]; then
-    echo "Error: Function source directory $TOP_LEVEL_SRC_DIR/$function_code_subdir does not exist." | tee -a "$LOG_FILE" "$function_log_file"
+  local source_path="$TOP_LEVEL_SRC_DIR/functions/$function_code_subdir"
+  if [ ! -d "$source_path" ]; then
+    log_and_echo "Error: Function source directory $source_path does not exist."
     exit 1
   fi
 
-  cp -r "$TOP_LEVEL_SRC_DIR/$function_code_subdir/"* "$staging_dir/"
-
+  cp -r "$source_path/"* "$staging_dir/"
   if [ ! -f "$staging_dir/main.py" ]; then
-    echo "Error: main.py not found in $staging_dir after copying." | tee -a "$LOG_FILE" "$function_log_file"
+    log_and_echo "Error: main.py not found in $staging_dir for $function_name."
     exit 1
   fi
 
   mkdir -p "$staging_dir/src"
-  if [ -d "$TOP_LEVEL_SRC_DIR/common" ]; then
-    cp -r "$TOP_LEVEL_SRC_DIR/common" "$staging_dir/src/"
-  fi
-  if [ -d "$TOP_LEVEL_SRC_DIR/configs" ]; then
-    cp -r "$TOP_LEVEL_SRC_DIR/configs" "$staging_dir/src/"
-  fi
+  cp -r "$TOP_LEVEL_SRC_DIR/common" "$staging_dir/src/"
+  cp -r "$TOP_LEVEL_SRC_DIR/configs" "$staging_dir/src/"
 
-  local req_file_source_path="$TOP_LEVEL_SRC_DIR/$function_code_subdir/requirements.txt"
-  local req_file_staging_path="$staging_dir/requirements.txt"
-  if [ -f "$req_file_source_path" ]; then
-    cp "$req_file_source_path" "$req_file_staging_path"
-    check_requirements "$req_file_staging_path" "$function_name"
-  else
-    echo "Error: requirements.txt not found in $req_file_source_path." | tee -a "$LOG_FILE" "$function_log_file"
-    exit 1
-  fi
+  check_requirements "$staging_dir/requirements.txt" "$function_name"
 
   local trigger_options=""
   if [ "$trigger_type" == "topic" ]; then
@@ -150,11 +117,27 @@ deploy_single_function() {
   elif [ "$trigger_type" == "gcs" ]; then
     trigger_options="--trigger-resource=$trigger_value --trigger-event=$gcs_event_type"
   else
-    echo "Error: Unknown trigger type '$function_type' for $function_name." | tee -a "$LOG_FILE" "$function_log_file"
+    log_and_echo "Error: Unknown trigger type '$trigger_type' for $function_name."
     exit 1
   fi
 
-  echo "Deploying $function_name..." | tee -a "$LOG_FILE"
+  local base_env_vars="GCP_PROJECT=${PROJECT_ID},LOG_LEVEL=INFO,PYTHONUNBUFFERED=1,FUNCTION_REGION=${REGION}"
+  local function_specific_env_vars=""
+  
+  if [[ "$function_name" == "scrape-fedao-sources" ]]; then
+    function_specific_env_vars+=",FEDAO_OUTPUT_BUCKET=${FEDAO_RAW_CSV_BUCKET_NAME}"
+    function_specific_env_vars+=",FEDAO_TREASURY_URL=https://www.newyorkfed.org/markets/domestic-market-operations/monetary-policy-implementation/treasury-securities/treasury-securities-operational-details"
+    function_specific_env_vars+=",FEDAO_AMBS_URL=https://www.newyorkfed.org/markets/ambs_operation_schedule#tabs-2"
+  elif [[ "$function_name" == "transform-fedao-csv" ]]; then
+    function_specific_env_vars+=",CUSTOMER_ID_FOR_FEDAO=simba"
+  fi
+
+  local final_env_vars="$base_env_vars$function_specific_env_vars"
+  if [ -n "$extra_env_vars" ] && [[ ! "$extra_env_vars" =~ "google.storage" ]]; then
+    final_env_vars+=",$extra_env_vars"
+  fi
+
+  log_and_echo "Deploying $function_name with ENV: $final_env_vars"
   if ! gcloud functions deploy "$function_name" \
     --runtime=python39 \
     $trigger_options \
@@ -163,162 +146,106 @@ deploy_single_function() {
     --project "$PROJECT_ID" \
     --region "$REGION" \
     --service-account "$SERVICE_ACCOUNT" \
-    --timeout "${timeout}s" \
+    --timeout "${timeout_seconds}s" \
     --memory "$memory" \
-    --no-gen2 \
+    --gen2 \
+    --set-env-vars "$final_env_vars" \
     >> "$function_log_file" 2>&1; then
-    echo "Error: Deployment of $function_name failed. Check $function_log_file." | tee -a "$LOG_FILE"
+    log_and_echo "Error: Deployment of $function_name failed. Check $function_log_file."
     return 1
   fi
 
-  echo "$function_name deployed successfully." | tee -a "$LOG_FILE"
+  log_and_echo "$function_name deployed successfully."
   rm -rf "$staging_dir"
   return 0
 }
 
-# Deploy web-renderer Cloud Run service
-deploy_web_renderer() {
-  local service_name="web-renderer"
-  local service_dir="services/web_renderer"
-  local image_name="europe-west1-docker.pkg.dev/$PROJECT_ID/web-renderer-repo/$service_name:latest"
-  local service_log_file="$LOG_DIR/${service_name}_$(date +%Y%m%d_%H%M%S).log"
+# --- Main Script ---
+log_and_echo "Starting Enhanced FEDAO deployment process at $(date)"
 
-  echo "Preparing deployment for $service_name Cloud Run service..." | tee -a "$LOG_FILE"
-  echo "Preparing deployment for $service_name..." >> "$service_log_file"
-
-  # Verify service directory exists
-  if [ ! -d "$TOP_LEVEL_SRC_DIR/$service_dir" ]; then
-    echo "Error: Service source directory $TOP_LEVEL_SRC_DIR/$service_dir does not exist." | tee -a "$LOG_FILE" "$service_log_file"
-    exit 1
-  fi
-
-  # Verify Dockerfile exists
-  if [ ! -f "$TOP_LEVEL_SRC_DIR/$service_dir/Dockerfile" ]; then
-    echo "Error: Dockerfile not found in $TOP_LEVEL_SRC_DIR/$service_dir." | tee -a "$LOG_FILE" "$service_log_file"
-    exit 1
-  fi
-
-  # Verify requirements.txt exists
-  if [ ! -f "$TOP_LEVEL_SRC_DIR/$service_dir/requirements.txt" ]; then
-    echo "Error: requirements.txt not found in $TOP_LEVEL_SRC_DIR/$service_dir." | tee -a "$LOG_FILE" "$service_log_file"
-    exit 1
-  fi
-
-  # Build and push Docker image
-  echo "Building and pushing Docker image for $service_name..." | tee -a "$LOG_FILE"
-  if ! gcloud builds submit "$TOP_LEVEL_SRC_DIR/$service_dir" \
-    --tag "$image_name" \
-    --project "$PROJECT_ID" \
-    --region "$REGION" \
-    >> "$service_log_file" 2>&1; then
-    echo "Error: Failed to build Docker image for $service_name. Check $service_log_file." | tee -a "$LOG_FILE"
-    exit 1
-  fi
-
-  # Deploy to Cloud Run
-  echo "Deploying $service_name to Cloud Run..." | tee -a "$LOG_FILE"
-  if ! gcloud run deploy "$service_name" \
-    --image "$image_name" \
-    --platform managed \
-    --region "$REGION" \
-    --no-allow-unauthenticated \
-    --memory 2Gi \
-    --cpu 2 \
-    --timeout 300 \
-    --concurrency 80 \
-    --project "$PROJECT_ID" \
-    --service-account "$SERVICE_ACCOUNT" \
-    >> "$service_log_file" 2>&1; then
-    echo "Error: Deployment of $service_name failed. Check $service_log_file." | tee -a "$LOG_FILE"
-    exit 1
-  fi
-
-  # Fetch service URL
-  echo "Fetching $service_name service URL..." | tee -a "$LOG_FILE"
-  local service_url
-  service_url=$(gcloud run services describe "$service_name" \
-    --platform managed \
-    --region "$REGION" \
-    --project "$PROJECT_ID" \
-    --format 'value(status.url)' 2>> "$service_log_file")
-  if [ -z "$service_url" ]; then
-    echo "Error: Failed to fetch service URL for $service_name." | tee -a "$LOG_FILE"
-    exit 1
-  fi
-  renderer_url="${service_url}/render"
-
-  # Update all project config files with the service URL
-  for config_file in "${PROJECT_CONFIGS[@]}"; do
-    if [ -f "$config_file" ]; then
-      echo "Updating $config_file with web-renderer URL: $renderer_url..." | tee -a "$LOG_FILE"
-      if ! jq ".web_renderer_url = \"$renderer_url\"" "$config_file" > "${config_file}.tmp" || ! mv "${config_file}.tmp" "$config_file"; then
-        echo "Error: Failed to update $config_file with web-renderer URL." | tee -a "$LOG_FILE"
-        exit 1
-      fi
-    else
-      echo "Warning: Config file $config_file not found, skipping update." | tee -a "$LOG_FILE"
-    fi
-  done
-
-  echo "$service_name deployed successfully." | tee -a "$LOG_FILE"
-  echo "Service URL: $service_url" | tee -a "$LOG_FILE"
-}
-
-# Verify gcloud authentication
-echo "Verifying gcloud authentication..." | tee -a "$LOG_FILE"
+log_and_echo "Verifying gcloud authentication and project settings..."
 if ! gcloud config set project "$PROJECT_ID" >> "$LOG_FILE" 2>&1; then
-  echo "Error: Failed to set project $PROJECT_ID." | tee -a "$LOG_FILE"
+  log_and_echo "Error: Failed to set project $PROJECT_ID. Check gcloud authentication."
   exit 1
 fi
 
-# Check quota project
-# check_quota_project
+log_and_echo "Enabling required Google Cloud services..."
+gcloud services enable run.googleapis.com \
+                       artifactregistry.googleapis.com \
+                       cloudbuild.googleapis.com \
+                       cloudfunctions.googleapis.com \
+                       pubsub.googleapis.com \
+                       firestore.googleapis.com \
+                       iam.googleapis.com \
+                       aiplatform.googleapis.com \
+                       eventarc.googleapis.com \
+                       --project="$PROJECT_ID" >> "$LOG_FILE" 2>&1
+log_and_echo "Required Google Cloud services enabled."
 
-# Create Artifact Registry repository if it doesn't exist
-echo "Checking for Artifact Registry repository..." | tee -a "$LOG_FILE"
-if ! gcloud artifacts repositories describe web-renderer-repo \
-  --location "$REGION" \
-  --project "$PROJECT_ID" >> "$LOG_FILE" 2>&1; then
-  echo "Creating web-renderer-repo repository..." | tee -a "$LOG_FILE"
-  gcloud artifacts repositories create web-renderer-repo \
-    --repository-format=docker \
-    --location "$REGION" \
-    --project "$PROJECT_ID" >> "$LOG_FILE" 2>&1
+log_and_echo "Granting Vertex AI User role to service account..."
+gcloud projects add-iam-policy-binding "$PROJECT_ID" \
+  --member="serviceAccount:$SERVICE_ACCOUNT" \
+  --role="roles/aiplatform.user" \
+  --condition=None >> "$LOG_FILE" 2>&1
+log_and_echo "Service account permissions updated."
+
+
+# Deploy functions
+DEPLOY_SUCCESS_COUNT=0
+DEPLOY_FAIL_COUNT=0
+
+log_and_echo "Deploying Cloud Functions..."
+
+# Deploy transform function
+log_and_echo "Deploying transform-fedao-csv function..."
+if deploy_single_function "transform-fedao-csv" "transform_fedao_csv_ai" \
+  "gcs" "$FEDAO_RAW_CSV_BUCKET_NAME" \
+  "transform_fedao_csv" "1Gi" "540" \
+  "google.storage.object.finalize"; then
+  ((DEPLOY_SUCCESS_COUNT++))
+  log_and_echo "✓ transform-fedao-csv deployed successfully"
+else
+  ((DEPLOY_FAIL_COUNT++))
+  log_and_echo "✗ transform-fedao-csv deployment failed"
 fi
 
-# Deploy web-renderer Cloud Run service
-# deploy_web_renderer
+# Deploy scraper function
+log_and_echo "Deploying scrape-fedao-sources function..."
+if deploy_single_function "scrape-fedao-sources" "scrape_fedao_sources_ai" \
+  "topic" "scrape-fedao-sources-topic" \
+  "scrape_fedao_sources" "2Gi" "540" \
+  ""; then
+  ((DEPLOY_SUCCESS_COUNT++))
+  log_and_echo "✓ scrape-fedao-sources deployed successfully"
+else
+  ((DEPLOY_FAIL_COUNT++))
+  log_and_echo "✗ scrape-fedao-sources deployment failed"
+fi
 
-# Deploy Cloud Functions
-echo "Checking for Pub/Sub topics..." | tee -a "$LOG_FILE"
-topics_to_ensure=(
-  "start-ingest-category-urls-topic"
-  "start-asic-ingest-category-urls-topic"
-  "start-analyze-website-schema-topic"
-  "discover-main-urls-topic"
-  "extract-initial-metadata-topic"
-  "fetch-content-topic"
-  "generate-xml-topic"
-  "generate-reports-topic"
-  "retry-pipeline"
-)
+# Summary
+log_and_echo "-------------------------------------------------"
+log_and_echo "FEDAO Deployment Summary:"
+log_and_echo "Successful deployments: $DEPLOY_SUCCESS_COUNT"
+log_and_echo "Failed deployments:     $DEPLOY_FAIL_COUNT"
+log_and_echo "GCS Bucket: gs://$FEDAO_RAW_CSV_BUCKET_NAME"
+log_and_echo "-------------------------------------------------"
 
-for topic in "${topics_to_ensure[@]}"; do
-  if ! gcloud pubsub topics describe "$topic" --project "$PROJECT_ID" >> "$LOG_FILE" 2>&1; then
-    echo "Creating $topic topic..." | tee -a "$LOG_FILE"
-    gcloud pubsub topics create "$topic" --project "$PROJECT_ID" >> "$LOG_FILE" 2>&1
-  fi
-done
+if [ "$DEPLOY_FAIL_COUNT" -gt 0 ]; then
+  log_and_echo "⚠️  Some deployments failed. Check logs in $LOG_DIR"
+  exit 1
+fi
 
-# Deploy Cloud Functions with corrected entry points
-# deploy_single_function "ingest-category-urls" "ingest_category_urls_pubsub" "topic" "start-ingest-category-urls-topic" "functions/ingest_category_urls" "256MB" "300"
-# deploy_single_function "ingest-category-urls-asic" "ingest_category_urls_pubsub" "topic" "start-asic-ingest-category-urls-topic" "functions/ingest_category_urls" "256MB" "300"
-# deploy_single_function "analyze-website-schema" "analyze_website_schema" "topic" "start-analyze-website-schema-topic" "functions/analyze_website_schema" "1GB" "540"
-# deploy_single_function "discover-main-urls" "discover_main_urls" "topic" "discover-main-urls-topic" "functions/discover_main_urls" "1GB" "540"
-# deploy_single_function "extract-initial-metadata" "extract_initial_metadata" "topic" "extract-initial-metadata-topic" "functions/extract_initial_metadata" "1GB" "540"
-deploy_single_function "fetch-content" "fetch_content" "topic" "fetch-content-topic" "functions/fetch_content" "512MB" "540"
-# deploy_single_function "generate-xml" "generate_xml" "topic" "generate-xml-topic" "functions/generate_xml" "512MB" "540"
-# deploy_single_function "generate-reports" "generate_reports" "topic" "generate-reports-topic" "functions/generate_reports" "512MB" "540"
-# deploy_single_function "retry-pipeline" "retry_pipeline" "topic" "retry-pipeline" "functions/retry_pipeline" "1GB" "300"
-
-echo "All deployments completed!" | tee -a "$LOG_FILE"
+log_and_echo "✅ All deployments completed successfully!"
+log_and_echo ""
+log_and_echo "🔧 Testing Instructions:"
+log_and_echo "1. Test the scraper by publishing a message to its Pub/Sub topic:"
+log_and_echo "   gcloud pubsub topics publish scrape-fedao-sources-topic --message='{}' --project=$PROJECT_ID"
+log_and_echo ""
+log_and_echo "2. Monitor function logs in the Google Cloud Console or via the CLI:"
+log_and_echo "   gcloud functions logs read scrape-fedao-sources --gen2 --project=$PROJECT_ID --region=$REGION --limit=50"
+log_and_echo "   gcloud functions logs read transform-fedao-csv --gen2 --project=$PROJECT_ID --region=$REGION --limit=50"
+log_and_echo ""
+log_and_echo "3. Check GCS bucket for the output files after the pipeline runs:"
+log_and_echo "   gsutil ls -r gs://$FEDAO_RAW_CSV_BUCKET_NAME/FEDAO/"
+log_and_echo ""
+log_and_echo "Deployment completed at $(date)"

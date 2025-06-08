@@ -1,0 +1,8 @@
+{
+  "customer_id": "simba",
+  "customer_name": "Simba Test Customer",
+  "gcp_project_id": "execo-simba",
+  "firestore_database_id": "(default)",
+  "apify_api_key_secret": "apify-api-key",
+  "description": "Test customer for FEDAO pipeline POC"
+}

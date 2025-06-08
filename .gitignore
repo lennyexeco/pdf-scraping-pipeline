@@ -6,6 +6,9 @@ __pycache__/
 # C extensions
 *.so
 
+# Google Cloud credentials
+execo-harvey-3a8e84accf75.json
+
 # Distribution / packaging
 .Python
 build/
