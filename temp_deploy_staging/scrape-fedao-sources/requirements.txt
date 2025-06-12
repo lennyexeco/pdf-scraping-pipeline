@@ -10,10 +10,5 @@ google-cloud-pubsub~=2.22.0
 google-cloud-logging>=2.7.0
 google-cloud-aiplatform==1.60.0
 google-cloud-secret-manager>=2.16.0
-vertexai
-
-# PDF Processing (Simplified)
 pdfplumber>=0.9.0
-
-# Excel Processing (for output)
-openpyxl>=3.1.0
+PyPDF2>=3.0.0

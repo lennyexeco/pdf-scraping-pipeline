@@ -1,0 +1,418 @@
+{
+  "project_name": "fedao_project",
+  "project_abbreviation": "FEDAO",
+  "customer_id": "simba",
+  "description": "Federal Reserve Bank of New York - Fed Announced Operations (AI-Enhanced Individual Operations Format)",
+  "firestore_collection": "fedao_documents",
+  "firestore_counters_collection": "fedao_counters",
+  "pipeline_version_tag": "2.0.0-AI",
+  "sequential_id_config": {
+    "enabled": true,
+    "firestore_counters_collection": "fedao_counters",
+    "counter_doc_prefix": "FEDAO_id_sequence"
+  },
+  "fedao_input_configs": {
+    "FEDAO_MOA_RAW_DATA": {
+      "data_type": "MOA",
+      "processing_method": "AI_ENHANCED",
+      "transformations": [
+        {
+          "type": "ai_intelligent_column_mapping",
+          "description": "Use AI to intelligently map source columns to target MOA schema"
+        },
+        {
+          "type": "ai_data_cleaning_and_standardization",
+          "description": "Use AI to clean and standardize MOA data values"
+        },
+        {
+          "type": "ai_source_date_determination",
+          "date_source_column": "OPERATION DATE",
+          "description": "Use AI to determine appropriate source date from operation dates"
+        },
+        {
+          "type": "ai_amount_parsing",
+          "description": "Use AI to parse MAXIMUM OPERATION SIZE into currency, size, and multiplier components"
+        },
+        {
+          "type": "standardize_moa_format",
+          "description": "Ensure exact expected MOA output format including MAXIMUMOPERATIONSIZE"
+        }
+      ],
+      "gcs_processed_path_root": "FEDAO/processed_csvs",
+      "gcs_incremental_path_root": "FEDAO/master_data",
+      "master_filename_template": "FEDAO_MOA_DATA.csv",
+      "output_document_type": "FEDAO_MOA_ITEM",
+      "expected_output_format": "individual_operation_records",
+      "ai_fallback_enabled": true
+    },
+    "FEDAO_TOA_RAW_DATA": {
+      "data_type": "TOA",
+      "processing_method": "AI_ENHANCED",
+      "transformations": [
+        {
+          "type": "ai_intelligent_column_mapping",
+          "description": "Use AI to intelligently map source columns to target TOA schema"
+        },
+        {
+          "type": "ai_data_cleaning_and_standardization",
+          "description": "Use AI to clean and standardize TOA data values"
+        },
+        {
+          "type": "ai_source_date_determination",
+          "date_source_column": "DATE",
+          "description": "Use AI to determine appropriate source date from operation dates"
+        },
+        {
+          "type": "ai_cusip_splitting",
+          "description": "Use AI to intelligently split multi-line CUSIP/amount cells into separate rows"
+        },
+        {
+          "type": "standardize_toa_format",
+          "description": "Ensure expected TOA output format"
+        }
+      ],
+      "gcs_processed_path_root": "FEDAO/processed_csvs",
+      "gcs_incremental_path_root": "FEDAO/master_data",
+      "master_filename_template": "FEDAO_TOA_DATA.csv",
+      "output_document_type": "FEDAO_TOA_ITEM",
+      "expected_output_format": "individual_operation_records",
+      "ai_fallback_enabled": true
+    }
+  },
+  "ai_processing_config": {
+    "enabled": true,
+    "gemini_api_key_env": "GEMINI_API_KEY",
+    "model": "gemini-2.0-flash-exp",
+    "api_url": "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash-exp:generateContent",
+    "temperature": 0.1,
+    "max_tokens": 8192,
+    "timeout_seconds": 45,
+    "batch_size": 20,
+    "fallback_to_hardcoded": true,
+    "confidence_threshold": 0.8,
+    "retry_attempts": 3,
+    "retry_delay_seconds": 2
+  },
+  "ai_schema_definitions": {
+    "moa_target_schema": {
+      "OPERATION DATE": {
+        "type": "string",
+        "format": "YYYY-MM-DD",
+        "description": "Single date in ISO format, not a range",
+        "required": true,
+        "validation_rules": ["no_date_ranges", "valid_iso_date"]
+      },
+      "OPERATION TIME(ET)": {
+        "type": "string", 
+        "format": "HH:MM",
+        "description": "Time in 24-hour format with ET timezone notation",
+        "required": false,
+        "validation_rules": ["valid_time_format"]
+      },
+      "SETTLEMENT DATE": {
+        "type": "string",
+        "format": "YYYY-MM-DD", 
+        "description": "Settlement date in ISO format",
+        "required": false,
+        "validation_rules": ["valid_iso_date"]
+      },
+      "OPERATION TYPE": {
+        "type": "string",
+        "description": "Type of operation (Purchase, Sale, Repo, etc.)",
+        "required": true,
+        "validation_rules": ["non_empty"]
+      },
+      "SECURITY TYPE AND MATURITY": {
+        "type": "string",
+        "description": "Security type and maturity information",
+        "required": false
+      },
+      "MATURITY RANGE": {
+        "type": "string",
+        "description": "Maturity range if specified",
+        "required": false
+      },
+      "MAXIMUM OPERATION CURRENCY": {
+        "type": "string",
+        "description": "Currency symbol (e.g., $, €)",
+        "required": false,
+        "validation_rules": ["valid_currency_symbol"]
+      },
+      "MAXIMUMOPERATIONSIZE": {
+        "type": "float",
+        "description": "Numeric value only, no currency or multiplier",
+        "required": false,
+        "validation_rules": ["numeric_only", "non_negative"]
+      },
+      "MAXIMUM OPERATION MULTIPLIER": {
+        "type": "string",
+        "description": "Multiplier (million, billion, etc.)",
+        "required": false,
+        "validation_rules": ["valid_multiplier"]
+      },
+      "Source_Date": {
+        "type": "string",
+        "format": "YYYYMMDD",
+        "description": "Source date in compact format",
+        "required": true,
+        "validation_rules": ["valid_compact_date"]
+      }
+    },
+    "toa_target_schema": {
+      "DATE": {
+        "type": "string",
+        "format": "YYYY-MM-DD",
+        "description": "Operation date in ISO format",
+        "required": true,
+        "validation_rules": ["valid_iso_date"]
+      },
+      "OPERATION TYPE": {
+        "type": "string",
+        "description": "Type of operation",
+        "required": true,
+        "validation_rules": ["non_empty"]
+      },
+      "SECURITY TYPE AND MATURITY": {
+        "type": "string",
+        "description": "Security type and maturity information",
+        "required": false
+      },
+      "CUSIP": {
+        "type": "string",
+        "description": "CUSIP identifier for the security",
+        "required": false,
+        "validation_rules": ["valid_cusip_format"]
+      },
+      "MAXIMUM PURCHASE AMOUNT": {
+        "type": "string",
+        "description": "Purchase amount with currency and multiplier",
+        "required": false
+      },
+      "Source_Date": {
+        "type": "string",
+        "format": "YYYYMMDD",
+        "description": "Source date in compact format",
+        "required": true,
+        "validation_rules": ["valid_compact_date"]
+      }
+    }
+  },
+  "field_mappings": {
+    "_comment_field_mappings": "These mappings are now primarily handled by AI, but kept for fallback compatibility.",
+    "Operation_Type": {"source": "OPERATION TYPE"},
+    "Security_Type": {"source": "SECURITY TYPE AND MATURITY"},
+    "Operation_Date": {"source": "OPERATION DATE || DATE"},
+    "Settlement_Date": {"source": "SETTLEMENT DATE"},
+    "Operation_Time": {"source": "OPERATION TIME(ET) || OPERATION TIME"},
+    "Maturity_Range": {"source": "MATURITY RANGE"},
+    "Maximum_Operation_Currency": {"source": "MAXIMUM OPERATION CURRENCY"},
+    "Maximum_Operation_Size": {"source": "MAXIMUMOPERATIONSIZE"},
+    "Maximum_Operation_Multiplier": {"source": "MAXIMUM OPERATION MULTIPLIER"},
+    "CUSIP": {"source": "CUSIP || Securities Included (CUSIP)"},
+    "Security_Maximum": {"source": "MAXIMUM PURCHASE AMOUNT || Security Maximums (Millions)"},
+    "Source_Date_Field": {"source": "Source_Date"}
+  },
+  "fedao_config": {
+    "_comment_fedao_config": "Enhanced with AI processing capabilities while maintaining compatibility.",
+    "title_source_columns": ["OPERATION TYPE", "SECURITY TYPE AND MATURITY"],
+    "default_topics": ["Federal Reserve Operations", "Treasury Securities", "Monetary Policy"],
+    "default_legislation": ["Federal Reserve Act"],
+    "expected_moa_columns": [
+      "OPERATION DATE", "OPERATION TIME(ET)", "SETTLEMENT DATE", "OPERATION TYPE",
+      "SECURITY TYPE AND MATURITY", "MATURITY RANGE", "MAXIMUM OPERATION CURRENCY",
+      "MAXIMUMOPERATIONSIZE", "MAXIMUM OPERATION MULTIPLIER", "Source_Date"
+    ],
+    "expected_toa_columns": [
+      "DATE", "OPERATION TYPE", "SECURITY TYPE AND MATURITY", "CUSIP",
+      "MAXIMUM PURCHASE AMOUNT", "Source_Date"
+    ],
+    "date_formats": {
+      "source_date_output": "YYYYMMDD",
+      "operation_date_input_parser": "ai_enhanced_flexible_parsing",
+      "operation_date_scraper_output": "YYYY-MM-DDTHH:MM:SS.sssZ"
+    },
+    "data_validation_rules": {
+      "_comment": "Enhanced validation rules with AI support.",
+      "moa_required_fields": ["OPERATION DATE", "OPERATION TYPE"],
+      "toa_required_fields": ["DATE", "OPERATION TYPE"],
+      "numeric_fields": ["MAXIMUMOPERATIONSIZE"],
+      "date_fields": ["OPERATION DATE", "SETTLEMENT DATE", "DATE"],
+      "currency_symbols": ["$", "€", "£", "¥"],
+      "multipliers": ["million", "billion"],
+      "ai_validation_enabled": true,
+      "schema_compliance_check": true,
+      "data_consistency_validation": true
+    }
+  },
+  "master_file_config": {
+    "_comment": "Enhanced master file handling with AI quality checks.",
+    "backup_enabled": true,
+    "backup_path_template": "FEDAO/master_data/backups/{date_str}/",
+    "validation_enabled": true,
+    "ai_quality_check_enabled": true,
+    "max_master_file_size_mb": 100,
+    "deduplication_method": "ai_enhanced"
+  },
+  "pubsub_topics": {
+    "_comment_extract_topic": "AI processing maintains compatibility with existing pub/sub architecture.",
+    "extract_initial_metadata_from_csv_row_topic": "extract-initial-metadata-topic",
+    "fetch_content_topic": "fetch-content-topic",
+    "generate_xml_topic": "generate-xml-topic",
+    "ai_processing_status_topic": "ai-processing-status-topic"
+  },
+  "ai_metadata_extraction": {
+    "enabled": true,
+    "reason": "AI now enhances structured CSV processing with intelligent column mapping and data cleaning.",
+    "extraction_method": "gemini_intelligent_mapping",
+    "confidence_threshold": 0.8,
+    "fallback_enabled": true
+  },
+  "data_quality_rules": {
+    "_comment_dedup": "Enhanced deduplication with AI-powered similarity detection.",
+    "moa_deduplication_columns": ["OPERATION DATE", "OPERATION TYPE", "SECURITY TYPE AND MATURITY", "OPERATION TIME(ET)"],
+    "toa_deduplication_columns": ["DATE", "OPERATION TYPE", "CUSIP", "MAXIMUM PURCHASE AMOUNT"],
+    "required_operation_fields": {
+      "moa": ["OPERATION DATE", "OPERATION TYPE"],
+      "toa": ["DATE", "OPERATION TYPE"]
+    },
+    "ai_duplicate_detection": {
+      "enabled": true,
+      "similarity_threshold": 0.9,
+      "semantic_matching": true
+    },
+    "data_anomaly_detection": {
+      "enabled": true,
+      "outlier_detection": true,
+      "pattern_validation": true
+    }
+  },
+  "scraping_config": {
+    "processing_method": "AI_ENHANCED",
+    "primary_data_sources": {
+      "moa": "ai_enhanced_html_table_extraction",
+      "toa": "ai_enhanced_ambs_page_extraction"
+    },
+    "secondary_data_sources": {
+      "moa": "html_fallback_extraction",
+      "toa": "html_fallback_extraction"
+    },
+    "ai_extraction_config": {
+      "table_detection_method": "intelligent_table_identification",
+      "data_mapping_method": "context_aware_field_mapping",
+      "data_cleaning_method": "semantic_data_standardization",
+      "confidence_validation": true,
+      "fallback_to_hardcoded": true
+    },
+    "date_parsing": {
+      "method": "AI_ENHANCED",
+      "input_formats_handled_by_parser": ["AI_FLEXIBLE_PARSING", "MM/DD/YYYY", "YYYY-MM-DD", "Month D, YYYY", "ISO with T and Z"],
+      "scraper_output_format": "YYYY-MM-DDTHH:MM:SS.sssZ",
+      "ai_date_range_handling": "extract_end_date",
+      "ai_date_validation": true
+    },
+    "pdf_processing": {
+      "enabled": false,
+      "reason": "AI focuses on HTML data extraction for better accuracy and consistency",
+      "pdf_limit_per_source": 0,
+      "max_operations_per_pdf": 0,
+      "timeout_seconds": 0
+    }
+  },
+  "output_validation": {
+    "_comment_validation": "Enhanced schema validation with AI quality checks.",
+    "ai_schema_validation": {
+      "enabled": true,
+      "strict_compliance": true,
+      "semantic_validation": true
+    },
+    "moa_schema": {
+      "required_columns": [
+        "OPERATION DATE", "OPERATION TIME(ET)", "SETTLEMENT DATE", "OPERATION TYPE",
+        "SECURITY TYPE AND MATURITY", "MATURITY RANGE", "MAXIMUM OPERATION CURRENCY",
+        "MAXIMUMOPERATIONSIZE", "MAXIMUM OPERATION MULTIPLIER", "Source_Date"
+      ],
+      "column_types": {
+        "OPERATION DATE": "string_iso_datetime", 
+        "SETTLEMENT DATE": "string_iso_datetime",
+        "MAXIMUMOPERATIONSIZE": "numeric_float", 
+        "Source_Date": "string_yyyymmdd"
+      },
+      "ai_validation_rules": {
+        "single_dates_only": true,
+        "no_duplicate_columns": true,
+        "consistent_data_types": true
+      }
+    },
+    "toa_schema": {
+      "required_columns": [
+        "DATE", "OPERATION TYPE", "SECURITY TYPE AND MATURITY", "CUSIP",
+        "MAXIMUM PURCHASE AMOUNT", "Source_Date"
+      ],
+      "column_types": {
+        "DATE": "string_iso_datetime", 
+        "Source_Date": "string_yyyymmdd"
+      },
+      "ai_validation_rules": {
+        "single_dates_only": true,
+        "proper_cusip_splitting": true,
+        "consistent_data_types": true
+      }
+    }
+  },
+  "environment_variables": {
+    "FEDAO_TREASURY_URL": "https://www.newyorkfed.org/markets/domestic-market-operations/monetary-policy-implementation/treasury-securities/treasury-securities-operational-details",
+    "FEDAO_AMBS_URL": "https://www.newyorkfed.org/markets/ambs_operation_schedule#tabs-2",
+    "FEDAO_OUTPUT_BUCKET": "execo-simba-fedao-poc",
+    "PDF_PROCESSING_LIMIT": "0",
+    "CUSTOMER_ID_FOR_FEDAO": "simba",
+    "GEMINI_API_KEY": "AIzaSyDDLEY8JIrgPgiqEUHqyJh0He4xmIrwxJs",
+    "AI_PROCESSING_ENABLED": "true",
+    "AI_FALLBACK_ENABLED": "true",
+    "AI_CONFIDENCE_THRESHOLD": "0.8",
+    "LOG_LEVEL": "INFO"
+  },
+  "function_mappings": {
+    "primary_scraper_function": "scrape_fedao_sources_ai",
+    "primary_transformer_function": "transform_fedao_csv_ai",
+    "fallback_scraper_function": "scrape_fedao_sources",
+    "fallback_transformer_function": "transform_fedao_csv",
+    "ai_validation_function": "validate_fedao_ai_output"
+  },
+  "compliance_notes": {
+    "runbook_version": "FEDAO_Runbook_v2.0_AI_Enhanced",
+    "expected_output_master_files": ["FEDAO_MOA_DATA.csv", "FEDAO_TOA_DATA.csv"],
+    "data_structure": "Individual operation records with AI-enhanced accuracy and consistency",
+    "key_requirements_from_runbook": [
+      "MAXIMUMOPERATIONSIZE column name (no underscores) for MOA numerical value - AI ensures single column.",
+      "MAXIMUM OPERATION CURRENCY and MAXIMUM OPERATION MULTIPLIER for MOA - AI parses correctly.",
+      "MAXIMUM PURCHASE AMOUNT for TOA (can be text like '$X million') - AI handles format variations.",
+      "OPERATION TIME(ET) column name with parentheses for MOA - AI extracts properly.",
+      "Source_Date field in YYYYMMDD format derived from latest operation date - AI determines intelligently.",
+      "Operation dates from scraper output in YYYY-MM-DDTHH:MM:SS.sssZ format - AI standardizes.",
+      "Individual operation records per row - AI ensures proper row splitting.",
+      "Incremental master file updates with proper deduplication - AI enhances duplicate detection.",
+      "Single dates in OPERATION DATE column - AI extracts end dates from ranges.",
+      "No duplicate or missing columns - AI validates schema compliance."
+    ],
+    "ai_enhancements": [
+      "Intelligent column mapping eliminates hardcoded assumptions about source data structure",
+      "AI-powered data cleaning handles edge cases and format variations automatically", 
+      "Smart date range processing ensures single dates in output columns",
+      "Context-aware parsing of Federal Reserve terminology and data formats",
+      "Automatic schema compliance validation with fallback protection",
+      "Robust handling of website structure changes through semantic understanding",
+      "Enhanced duplicate detection using similarity algorithms",
+      "Improved data quality through AI-powered anomaly detection"
+    ],
+    "quality_guarantees": [
+      "Single dates guaranteed in OPERATION DATE column (no ranges)",
+      "Proper OPERATION TIME(ET) extraction with timezone notation", 
+      "MAXIMUMOPERATIONSIZE as single numeric column (no duplicates)",
+      "Intelligent CUSIP splitting for TOA records with proper row handling",
+      "Consistent Source_Date in YYYYMMDD format across all records",
+      "Schema-compliant output with comprehensive validation",
+      "Fallback protection ensures processing continues if AI fails",
+      "Backward compatibility maintained with existing pipeline components"
+    ]
+  }
+}

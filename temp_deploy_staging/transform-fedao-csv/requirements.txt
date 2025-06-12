@@ -1,0 +1,10 @@
+# requirements.txt
+
+pandas
+requests
+google-cloud-storage
+google-cloud-firestore
+functions-framework
+google-cloud-logging
+google-cloud-secret-manager
+google-cloud-aiplatform
