@@ -202,6 +202,40 @@ class SmartFEDAOExtractor:
         
         return unique_pdf_links
 
+    def pre_process_raw_table(self, table: List[List]) -> List[List]:
+        """
+        Adapts the logic from the local parser to merge split-rows before sending to AI.
+        """
+        if not table:
+            return []
+
+        processed_rows = []
+        i = 0
+        while i < len(table):
+            row1 = table[i]
+            row2 = table[i + 1] if (i + 1) < len(table) else []
+
+            # Simple check to see if row1 looks like the start of a multi-line entry
+            # A more robust check, like in your local parser, would be better.
+            is_split_row = len(row1) > 2 and row1[0] and not row1[-1]
+
+            if is_split_row and row2:
+                # Combine row1 and row2 into a single, coherent row
+                combined_row = []
+                for j in range(max(len(row1), len(row2))):
+                    cell1 = row1[j] if j < len(row1) else ''
+                    cell2 = row2[j] if j < len(row2) else ''
+                    # Combine the text from the two cells
+                    combined_text = f"{cell1 or ''} {cell2 or ''}".strip()
+                    combined_row.append(combined_text)
+                
+                processed_rows.append(combined_row)
+                i += 2  # Skip the next row since we've merged it
+            else:
+                processed_rows.append(row1)
+                i += 1
+                
+        return processed_rows
     def extract_text_from_pdf(self, pdf_url: str) -> str:
     """Extract table data from PDF using enhanced pdfplumber method with better table detection and fix row-overflows."""
     try:
@@ -237,7 +271,8 @@ class SmartFEDAOExtractor:
             os.unlink(temp_file.name)
 
             if all_table_data:
-                csv_content = self.convert_table_to_csv_improved(all_table_data, pdf_url)
+                clean_table_data = self.pre_process_raw_table(all_table_data)
+                csv_content = self.convert_table_to_csv_ai_enhanced(clean_table_data, pdf_url)
 
                 # Post-processing step to fix row-overflow
                 df = pd.read_csv(StringIO(csv_content), dtype=str).fillna('')
@@ -275,123 +310,84 @@ def fix_row_overflows(self, df: pd.DataFrame) -> pd.DataFrame:
     return pd.DataFrame(fixed_rows)
 
 
-def convert_table_to_csv_improved(self, table: List[List], pdf_url: str) -> str:
-    """Improved table to CSV conversion with better header detection and cell boundary handling"""
-    if not table or len(table) == 0:
+def convert_table_to_csv_ai_enhanced(self, table: List[List], pdf_url: str) -> str:
+    """
+    Converts a raw table from pdfplumber into a clean CSV string using Vertex AI
+    to semantically understand the header and data structure.
+    """
+    if not table or len(table) < 2:  # Need at least a potential header and data row
+        self.logger.warning(f"Table from {pdf_url} is too small to process.")
         return ""
 
-    self.logger.info(f"Processing table with {len(table)} rows from {pdf_url}")
+    # Convert the raw table to a JSON string for the model.
+    # No need for heavy pre-processing; the model can handle messy data.
+    raw_table_json = json.dumps(table, indent=2)
 
-    # Step 1: Clean and normalize all cells
-    cleaned_table = []
-    max_cols = 0
+    # The prompt is crucial. We instruct the model to act as an expert
+    # and define the exact JSON structure we want in return.
+    prompt = f"""
+You are an expert data extraction assistant. Your task is to analyze a **pre-processed and cleaned table** from a PDF and ensure it is correctly structured as clean JSON.
 
-    for row_idx, row in enumerate(table):
-        if row is None:
-            continue
+The provided table has already been processed to handle common structural issues like multi-line rows.
 
-        cleaned_row = []
-        for cell in row:
-            if cell is not None:
-                cell_content = str(cell).strip()
-                cell_content = re.sub(r'\s+', ' ', cell_content)
-                cell_content = re.sub(r'[,\t\n\r]', ' ', cell_content)
-                cell_content = cell_content.strip()
-                cleaned_row.append(cell_content)
-            else:
-                cleaned_row.append("")
+Here is the cleaned table data:
+{raw_table_json}
 
-        if any(cell.strip() for cell in cleaned_row):
-            cleaned_table.append(cleaned_row)
-            max_cols = max(max_cols, len(cleaned_row))
+Your instructions are:
+1.  **Identify the Header:** The header should now be on a single, clear row. Identify it.
+2.  **Validate Data Rows:** Ensure each data row has the same number of columns as the header.
+3.  **Standardize Data:** Clean up any remaining artifacts (e.g., extra whitespace) and ensure data formats are consistent.
+4.  **Output Format:** Your final output MUST be a single, valid JSON object with "headers" and "data" keys.
 
-    if not cleaned_table:
-        self.logger.warning(f"No valid data rows found in table from {pdf_url}")
+Now, process the provided clean table data and generate the structured JSON.
+"""
+
+    try:
+        self.logger.info(f"Calling Vertex AI to process table from {pdf_url}")
+        
+        # Using the Vertex AI SDK to call the model
+        response = self.model.generate_content(
+            [prompt],
+            generation_config={
+                "max_output_tokens": 8192,
+                "temperature": 0.0,  # Set to 0 for deterministic, structured output
+                "response_mime_type": "application/json", # Ensures the model output is valid JSON
+            },
+        )
+        
+        # The response.text is now a guaranteed JSON string
+        structured_result = json.loads(response.text)
+
+        # --- Validation of the AI Model's Output ---
+        if "headers" not in structured_result or "data" not in structured_result:
+            self.logger.error(f"AI response for {pdf_url} is missing 'headers' or 'data' keys.")
+            return ""
+
+        headers = structured_result['headers']
+        data_rows = structured_result['data']
+
+        if not isinstance(headers, list) or not isinstance(data_rows, list):
+            self.logger.error(f"AI response for {pdf_url} has incorrect data types for keys.")
+            return ""
+
+        self.logger.info(f"AI successfully processed table from {pdf_url}:")
+        self.logger.info(f"  - Detected Headers: {headers}")
+        self.logger.info(f"  - Detected Data Rows: {len(data_rows)}")
+
+        # --- Convert the clean, structured data to CSV ---
+        # This part is now simple and reliable because the AI did the hard work.
+        output = StringIO()
+        writer = csv.writer(output, quoting=csv.QUOTE_MINIMAL)
+        
+        writer.writerow(headers)
+        writer.writerows(data_rows)
+        
+        csv_content = output.getvalue()
+        return csv_content
+
+    except Exception as e:
+        self.logger.error(f"An error occurred calling Vertex AI or processing its response for {pdf_url}: {e}", exc_info=True)
         return ""
-
-    # Step 2: Normalize all rows to have the same number of columns
-    normalized_table = []
-    for row in cleaned_table:
-        normalized_row = row[:]
-        while len(normalized_row) < max_cols:
-            normalized_row.append("")
-        normalized_table.append(normalized_row[:max_cols])
-
-    # Step 3: Smart header detection with multi-line support
-    header_row_indices = []
-    fed_header_keywords = [
-        'operation date', 'operation time', 'settlement date', 'operation type',
-        'security type', 'maturity', 'maximum', 'size', 'cusip', 'securities included',
-        'security maximums', 'operation maximum', 'date', 'time', 'type'
-    ]
-
-    for i, row in enumerate(normalized_table[:5]):  # Check first 5 rows
-        row_text = ' '.join(row).lower()
-        keyword_matches = sum(1 for keyword in fed_header_keywords if keyword in row_text)
-        if keyword_matches > 0:
-            header_row_indices.append(i)
-
-    header_to_use = None
-    data_rows_start_index = 0
-
-    # Check for consecutive header rows to merge
-    if len(header_row_indices) > 1 and all(header_row_indices[i] == header_row_indices[i-1] + 1 for i in range(1, len(header_row_indices))):
-        self.logger.info(f"Detected {len(header_row_indices)} consecutive header rows. Merging them.")
-        merged_header = [""] * max_cols
-        for col_idx in range(max_cols):
-            header_parts = [normalized_table[row_idx][col_idx] for row_idx in header_row_indices if col_idx < len(normalized_table[row_idx])]
-            merged_header[col_idx] = " ".join(part for part in header_parts if part)
-
-        header_to_use = merged_header
-        data_rows_start_index = max(header_row_indices) + 1
-
-    elif header_row_indices: # Single header row detected
-        self.logger.info(f"Detected a single header row at index {header_row_indices[0]}.")
-        header_to_use = normalized_table[header_row_indices[0]]
-        data_rows_start_index = header_row_indices[0] + 1
-    
-    else: # No header detected, use generic headers
-        self.logger.info("No header row detected. Using generic headers.")
-        header_to_use = [f"COLUMN_{i+1}" for i in range(max_cols)]
-        data_rows_start_index = 0
-
-    # Clean up the final header
-    cleaned_headers = []
-    for header in header_to_use:
-        clean_header = header.strip().upper()
-        clean_header = re.sub(r'[^\w\s()-]', ' ', clean_header)
-        clean_header = re.sub(r'\s+', ' ', clean_header).strip()
-        cleaned_headers.append(clean_header if clean_header else f"COLUMN_{len(cleaned_headers) + 1}")
-
-    final_table = [cleaned_headers] + normalized_table[data_rows_start_index:]
-    
-    # Step 5: Final validation and cleanup
-    if len(final_table) < 2:
-        self.logger.warning(f"Table too small after processing: {len(final_table)} rows")
-        return ""
-
-    # Remove completely empty data rows
-    header = final_table[0]
-    clean_data_rows = [row for row in final_table[1:] if any(cell.strip() for cell in row)]
-
-    if not clean_data_rows:
-        self.logger.warning(f"No valid data rows found after cleanup")
-        return ""
-
-    final_table = [header] + clean_data_rows
-
-    # Step 6: Convert to CSV
-    output = StringIO()
-    writer = csv.writer(output, quoting=csv.QUOTE_MINIMAL)
-    writer.writerows(final_table)
-    csv_content = output.getvalue()
-
-    self.logger.info(f"Generated CSV from {pdf_url}:")
-    self.logger.info(f"  - Headers: {header}")
-    self.logger.info(f"  - Data rows: {len(clean_data_rows)}")
-    self.logger.info(f"  - Columns: {len(header)}")
-
-    return csv_content
 
     def extract_with_ai_enhanced(self, html_content: str, table_type: str) -> List[Dict]:
         """Enhanced AI extraction with PROPER header handling for CSV conversion."""

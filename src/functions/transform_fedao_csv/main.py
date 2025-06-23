@@ -211,91 +211,33 @@ class FEDAODataProcessor:
         return None
 
     def _split_operation_size_column(self, series: pd.Series) -> Tuple[List[str], List[str], List[str]]:
-        """Split operation size column into currency, size, and multiplier with enhanced pattern matching."""
-        
-        currency_data = []
-        size_data = []
-        multiplier_data = []
-        
+        """
+        A direct adaptation of the regex logic from the local frbny_parser.py
+        """
+        currency_data, size_data, multiplier_data = [], [], []
+
         for value in series:
-            if pd.isna(value) or not str(value).strip():
-                currency_data.append('')
-                size_data.append('')
-                multiplier_data.append('')
-                continue
-            
             value_str = str(value).strip()
-            self.logger.debug(f"Processing operation size value: '{value_str}'")
-            
-            # Extract currency (symbols at the beginning)
-            currency_match = re.match(r'^([^\d\s]*)', value_str)
-            currency = currency_match.group(1).strip() if currency_match and currency_match.group(1).strip() else ''
-            
-            # Extract numeric value (including decimals and commas)
-            numeric_match = re.search(r'([\d,]+\.?\d*)', value_str)
-            numeric_value = numeric_match.group(1).replace(',', '') if numeric_match else ''
-            
-            # Enhanced multiplier extraction with better pattern matching
+            size = ''
             multiplier = ''
-            
-            # Look for complete words first, then partial matches
-            multiplier_patterns = [
-                # Complete words (case insensitive)
-                (r'\b(trillion|trillions)\b', 'Trillion'),
-                (r'\b(billion|billions)\b', 'Billion'), 
-                (r'\b(million|millions)\b', 'Million'),
-                (r'\b(thousand|thousands)\b', 'Thousand'),
-                # Abbreviated forms
-                (r'\b(tn|tri)\b', 'Trillion'),
-                (r'\b(bn|bil)\b', 'Billion'),
-                (r'\b(mn|mil)\b', 'Million'),
-                (r'\b(k|th)\b', 'Thousand'),
-                # Single letters at word boundaries
-                (r'\bt\b', 'Trillion'),
-                (r'\bb\b', 'Billion'),
-                (r'\bm\b', 'Million'),
-                # Partial word matches (for truncated text like "Millio")
-                (r'millio[n]?', 'Million'),
-                (r'billio[n]?', 'Billion'),
-                (r'trillio[n]?', 'Trillion'),
-                (r'thousan[d]?', 'Thousand'),
-            ]
-            
-            # Try each pattern
-            for pattern, standard_form in multiplier_patterns:
-                if re.search(pattern, value_str, re.IGNORECASE):
-                    multiplier = standard_form
-                    break
-            
-            # If no standard multiplier found, check for any remaining text that might be a truncated multiplier
-            if not multiplier:
-                # Remove currency and number, see what's left
-                remaining_text = value_str
-                if currency:
-                    remaining_text = remaining_text.replace(currency, '', 1).strip()
-                if numeric_value:
-                    remaining_text = re.sub(r'[\d,]+\.?\d*', '', remaining_text).strip()
-                
-                if remaining_text:
-                    # Try to match partial multipliers
-                    remaining_lower = remaining_text.lower()
-                    if 'mill' in remaining_lower or 'mil' in remaining_lower:
-                        multiplier = 'Million'
-                    elif 'bill' in remaining_lower or 'bil' in remaining_lower:
-                        multiplier = 'Billion'
-                    elif 'trill' in remaining_lower or 'tri' in remaining_lower:
-                        multiplier = 'Trillion'
-                    elif 'thous' in remaining_lower or 'th' in remaining_lower:
-                        multiplier = 'Thousand'
-                    
-                    self.logger.debug(f"Found partial multiplier '{remaining_text}' -> '{multiplier}'")
-            
-            currency_data.append(currency)
-            size_data.append(numeric_value)
+            currency = '$' # Default
+
+            # Pattern 1: $80 million (most reliable)
+            pattern1 = re.search(r'\$(\d+(?:\.\d+)?)\s*(million|billion)', value_str, re.IGNORECASE)
+            if pattern1:
+                size = pattern1.group(1)
+                multiplier = pattern1.group(2).capitalize()
+            else:
+                # Pattern 2: 80 million (no dollar sign)
+                pattern2 = re.search(r'\b(\d+(?:\.\d+)?)\s*(million|billion)\b', value_str, re.IGNORECASE)
+                if pattern2:
+                    size = pattern2.group(1)
+                    multiplier = pattern2.group(2).capitalize()
+
+            size_data.append(size)
             multiplier_data.append(multiplier)
-            
-            self.logger.debug(f"Split '{value_str}' -> Currency: '{currency}', Size: '{numeric_value}', Multiplier: '{multiplier}'")
-        
+            currency_data.append(currency)
+
         return currency_data, size_data, multiplier_data
 
     def _clean_text(self, text_value):

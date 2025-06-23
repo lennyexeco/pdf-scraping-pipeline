@@ -148,22 +148,22 @@ fi
 log_and_echo "  - Renderer URL found: $RENDERER_URL"
 
 # Deploy the Transformer Function
-# log_and_echo "  - Deploying 'transform-fedao-csv' function..."
-# gcloud functions deploy "transform-fedao-csv" \
-#     --gen2 \
-#     --runtime=python39 \
-#     --region="$REGION" \
-#     --project="$PROJECT_ID" \
-#     --source="$TRANSFORM_FUNC_SRC_SUBDIR" \
-#     --entry-point="transform_fedao_csv_ai" \
-#     --trigger-resource="$FEDAO_RAW_CSV_BUCKET_NAME" \
-#     --trigger-event="google.storage.object.finalize" \
-#     --service-account="$SERVICE_ACCOUNT" \
-#     --timeout="540s" \
-#     --memory="1Gi" \
-#     --set-env-vars="GCP_PROJECT=${PROJECT_ID},LOG_LEVEL=INFO,CUSTOMER_ID_FOR_FEDAO=simba,FUNCTION_REGION=${REGION}" \
-#     >> "$LOG_FILE" 2>&1
-# log_and_echo "  ✓ 'transform-fedao-csv' deployed."
+log_and_echo "  - Deploying 'transform-fedao-csv' function..."
+gcloud functions deploy "transform-fedao-csv" \
+    --gen2 \
+    --runtime=python39 \
+    --region="$REGION" \
+    --project="$PROJECT_ID" \
+    --source="$TRANSFORM_FUNC_SRC_SUBDIR" \
+    --entry-point="transform_fedao_csv_ai" \
+    --trigger-resource="$FEDAO_RAW_CSV_BUCKET_NAME" \
+    --trigger-event="google.storage.object.finalize" \
+    --service-account="$SERVICE_ACCOUNT" \
+    --timeout="540s" \
+    --memory="1Gi" \
+    --set-env-vars="GCP_PROJECT=${PROJECT_ID},LOG_LEVEL=INFO,CUSTOMER_ID_FOR_FEDAO=simba,FUNCTION_REGION=${REGION}" \
+    >> "$LOG_FILE" 2>&1
+log_and_echo "  ✓ 'transform-fedao-csv' deployed."
 
 # # Deploy the Scraper Function
 log_and_echo "  - Deploying 'scrape-fedao-sources' function..."
